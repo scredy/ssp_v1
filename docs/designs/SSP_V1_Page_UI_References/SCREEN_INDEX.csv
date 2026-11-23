@@ -1,0 +1,60 @@
+﻿Board,Section,Design screen,Image path,Existing route (if known)
+01 — Public Website,1,Home,screens/board_01_public-website/01_home.png,/
+01 — Public Website,2,Vehicles Catalogue,screens/board_01_public-website/02_vehicles-catalogue.png,/cars
+01 — Public Website,3,Vehicle Detail,screens/board_01_public-website/03_vehicle-detail.png,/cars/[reference]
+01 — Public Website,4,Finance Calculator,screens/board_01_public-website/04_finance-calculator.png,/finance
+01 — Public Website,5,Book Appointment,screens/board_01_public-website/05_book-appointment.png,Not confirmed / future screen
+01 — Public Website,6,Track Vehicle,screens/board_01_public-website/06_track-vehicle.png,Not confirmed / future screen
+01 — Public Website,7,About SSP,screens/board_01_public-website/07_about-ssp.png,/about
+01 — Public Website,8,Request Quote,screens/board_01_public-website/08_request-quote.png,Not confirmed / future screen
+02 — Admin Workspace,1,Admin Dashboard,screens/board_02_admin-workspace/01_admin-dashboard.png,/staff (Admin role)
+02 — Admin Workspace,2,Users Directory,screens/board_02_admin-workspace/02_users-directory.png,/staff/accounts
+02 — Admin Workspace,3,Create User,screens/board_02_admin-workspace/03_create-user.png,Not confirmed / future screen
+02 — Admin Workspace,4,User Profile Edit,screens/board_02_admin-workspace/04_user-profile-edit.png,Not confirmed / future screen
+02 — Admin Workspace,5,Recent Account Activity,screens/board_02_admin-workspace/05_recent-account-activity.png,/staff/activity
+02 — Admin Workspace,6,Audit History,screens/board_02_admin-workspace/06_audit-history.png,Not confirmed / future screen
+03 — Staff Inventory and Reservations,1,Staff Dashboard,screens/board_03_staff-inventory-and-reservations/01_staff-dashboard.png,/staff (Staff role)
+03 — Staff Inventory and Reservations,2,Vehicle Inventory,screens/board_03_staff-inventory-and-reservations/02_vehicle-inventory.png,/staff/inventory
+03 — Staff Inventory and Reservations,3,Add Vehicle,screens/board_03_staff-inventory-and-reservations/03_add-vehicle.png,Not confirmed / future screen
+03 — Staff Inventory and Reservations,4,Edit Vehicle Photos Publication,screens/board_03_staff-inventory-and-reservations/04_edit-vehicle-photos-publication.png,/staff/inventory
+03 — Staff Inventory and Reservations,5,Vehicle Internal Detail,screens/board_03_staff-inventory-and-reservations/05_vehicle-internal-detail.png,/staff/inventory
+03 — Staff Inventory and Reservations,6,Reservations,screens/board_03_staff-inventory-and-reservations/06_reservations.png,/staff/reservations
+04 — Shared Access Mobile and System States,1,Staff Sign In,screens/board_04_shared-access-mobile-and-system-states/01_staff-sign-in.png,/staff/login
+04 — Shared Access Mobile and System States,2,Set Password Invitation,screens/board_04_shared-access-mobile-and-system-states/02_set-password-invitation.png,Not confirmed / future screen
+04 — Shared Access Mobile and System States,3,Forgot Reset Password,screens/board_04_shared-access-mobile-and-system-states/03_forgot-reset-password.png,Not confirmed / future screen
+04 — Shared Access Mobile and System States,4,Profile And Security,screens/board_04_shared-access-mobile-and-system-states/04_profile-and-security.png,Not confirmed / future screen
+04 — Shared Access Mobile and System States,5,Notification Inbox,screens/board_04_shared-access-mobile-and-system-states/05_notification-inbox.png,Not confirmed / future screen
+04 — Shared Access Mobile and System States,6,Access Denied And Not Found,screens/board_04_shared-access-mobile-and-system-states/06_access-denied-and-not-found.png,Not confirmed / future screen
+04 — Shared Access Mobile and System States,7,Mobile Staff Inventory And Edit,screens/board_04_shared-access-mobile-and-system-states/07_mobile-staff-inventory-and-edit.png,/staff/inventory (mobile)
+04 — Shared Access Mobile and System States,8,Mobile Rep Catalogue Tracking,screens/board_04_shared-access-mobile-and-system-states/08_mobile-rep-catalogue-tracking.png,Not confirmed / future screen
+04 — Shared Access Mobile and System States,Shared,Common UI States,screens/board_04_shared-access-mobile-and-system-states/09_common-ui-states.png,Shared pattern / not a separate page
+05 — Staff Imports Quotations Enquiries,1,Import Tracking Directory,screens/board_05_staff-imports-quotations-enquiries/01_import-tracking-directory.png,Not confirmed / future screen
+05 — Staff Imports Quotations Enquiries,2,Create Import,screens/board_05_staff-imports-quotations-enquiries/02_create-import.png,Not confirmed / future screen
+05 — Staff Imports Quotations Enquiries,3,Import Detail Timeline,screens/board_05_staff-imports-quotations-enquiries/03_import-detail-timeline.png,Not confirmed / future screen
+05 — Staff Imports Quotations Enquiries,4,Quotations List,screens/board_05_staff-imports-quotations-enquiries/04_quotations-list.png,Not confirmed / future screen
+05 — Staff Imports Quotations Enquiries,5,Create Quotation,screens/board_05_staff-imports-quotations-enquiries/05_create-quotation.png,Not confirmed / future screen
+05 — Staff Imports Quotations Enquiries,6,Appointments And Quote Requests Inbox,screens/board_05_staff-imports-quotations-enquiries/06_appointments-and-quote-requests-inbox.png,/staff/enquiries
+06 — MD Sales and Payments,1,MD Dashboard,screens/board_06_md-sales-and-payments/01_md-dashboard.png,/staff (MD role)
+06 — MD Sales and Payments,2,Sales Directory,screens/board_06_md-sales-and-payments/02_sales-directory.png,/staff/sales
+06 — MD Sales and Payments,3,New Sale,screens/board_06_md-sales-and-payments/03_new-sale.png,/staff/sales
+06 — MD Sales and Payments,4,Sale Detail,screens/board_06_md-sales-and-payments/04_sale-detail.png,/staff/sales
+06 — MD Sales and Payments,5,Payments Directory,screens/board_06_md-sales-and-payments/05_payments-directory.png,Not confirmed / future screen
+06 — MD Sales and Payments,6,Record Payment,screens/board_06_md-sales-and-payments/06_record-payment.png,Not confirmed / future screen
+07 — Representative Portal,1,Representative Dashboard,screens/board_07_representative-portal/01_representative-dashboard.png,/staff (Rep role)
+07 — Representative Portal,2,My Sales Directory,screens/board_07_representative-portal/02_my-sales-directory.png,Not confirmed / future screen
+07 — Representative Portal,3,My Sale Detail,screens/board_07_representative-portal/03_my-sale-detail.png,Not confirmed / future screen
+07 — Representative Portal,4,My Commissions Ledger,screens/board_07_representative-portal/04_my-commissions-ledger.png,Not confirmed / future screen
+07 — Representative Portal,5,Representative Leaderboard,screens/board_07_representative-portal/05_representative-leaderboard.png,Not confirmed / future screen
+08 — MD Representatives and Commission Rules,1,Representatives Directory,screens/board_08_md-representatives-and-commission-rules/01_representatives-directory.png,/staff/reps
+08 — MD Representatives and Commission Rules,2,Add Representative,screens/board_08_md-representatives-and-commission-rules/02_add-representative.png,/staff/reps
+08 — MD Representatives and Commission Rules,3,Representative Detail,screens/board_08_md-representatives-and-commission-rules/03_representative-detail.png,/staff/reps
+08 — MD Representatives and Commission Rules,4,Commission Brackets Settings,screens/board_08_md-representatives-and-commission-rules/04_commission-brackets-settings.png,Not confirmed / future screen
+08 — MD Representatives and Commission Rules,5,Commission Ledger,screens/board_08_md-representatives-and-commission-rules/05_commission-ledger.png,Not confirmed / future screen
+08 — MD Representatives and Commission Rules,6,MD Leaderboard,screens/board_08_md-representatives-and-commission-rules/06_md-leaderboard.png,Not confirmed / future screen
+09 — CEO Executive Workspace,1,CEO Overview,screens/board_09_ceo-executive-workspace/01_ceo-overview.png,/staff (CEO role)
+09 — CEO Executive Workspace,2,Sales Executive Overview,screens/board_09_ceo-executive-workspace/02_sales-executive-overview.png,Not confirmed / future screen
+09 — CEO Executive Workspace,3,Sale Detail Readonly,screens/board_09_ceo-executive-workspace/03_sale-detail-readonly.png,/staff/sales (CEO read-only)
+09 — CEO Executive Workspace,4,Commission Overview,screens/board_09_ceo-executive-workspace/04_commission-overview.png,Not confirmed / future screen
+09 — CEO Executive Workspace,5,CEO Leaderboard,screens/board_09_ceo-executive-workspace/05_ceo-leaderboard.png,Not confirmed / future screen
+09 — CEO Executive Workspace,6,BL Requests,screens/board_09_ceo-executive-workspace/06_bl-requests.png,Not confirmed / future screen
+09 — CEO Executive Workspace,Shared,Commission Business Rules Notes,screens/board_09_ceo-executive-workspace/07_commission-business-rules-notes.png,Shared pattern / not a separate page

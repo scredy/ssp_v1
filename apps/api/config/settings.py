@@ -1,5 +1,7 @@
 import os
 from pathlib import Path
+from decimal import Decimal
+from corsheaders.defaults import default_headers
 
 from dotenv import load_dotenv
 
@@ -9,6 +11,13 @@ REPO_ROOT = BASE_DIR.parent.parent
 # Database variables are loaded from the repository's local .env and used only here.
 load_dotenv(REPO_ROOT / ".env")
 load_dotenv(BASE_DIR / ".env", override=True)
+
+FINANCE_ESTIMATE_PER_100K = {
+    "36m": Decimal(os.environ.get("NEXT_PUBLIC_FINANCE_36M_PER_100K", "3575.84")),
+    "60m": Decimal(os.environ.get("NEXT_PUBLIC_FINANCE_60M_PER_100K", "2483")),
+    "72m": Decimal(os.environ.get("NEXT_PUBLIC_FINANCE_72M_PER_100K", "2275")),
+    "od": Decimal(os.environ.get("NEXT_PUBLIC_FINANCE_OD_PER_100K", "1330")),
+}
 
 DEBUG = os.environ.get("DJANGO_DEBUG", "1").lower() in {"1", "true", "yes", "on"}
 SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "dev-only-change-me")
@@ -75,7 +84,7 @@ REST_FRAMEWORK = {
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.IsAuthenticated",
     ],
-    "DEFAULT_THROTTLE_RATES": {"anon": "10/minute"},
+    "DEFAULT_THROTTLE_RATES": {"anon": "10/minute", "public_enquiry": "5/hour", "import_tracking": "5/minute"},
 }
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
@@ -93,6 +102,14 @@ CSRF_TRUSTED_ORIGINS = [origin.strip() for origin in os.environ.get(
     "CSRF_TRUSTED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
 ).split(",") if origin.strip()]
 CORS_ALLOW_CREDENTIALS = True
+EMAIL_BACKEND = os.environ.get("EMAIL_BACKEND", "django.core.mail.backends.console.EmailBackend" if DEBUG else "django.core.mail.backends.smtp.EmailBackend")
+EMAIL_HOST = os.environ.get("EMAIL_HOST", "localhost")
+EMAIL_PORT = int(os.environ.get("EMAIL_PORT", "25"))
+EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER", "")
+EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD", "")
+EMAIL_USE_TLS = os.environ.get("EMAIL_USE_TLS", "false").lower() in {"1", "true", "yes", "on"}
+DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "SSP Motor Trading <no-reply@localhost>")
+ACCOUNT_PORTAL_URL = os.environ.get("ACCOUNT_PORTAL_URL", "http://localhost:3000").rstrip("/")
 SECURE_SSL_REDIRECT = not DEBUG
 SECURE_CONTENT_TYPE_NOSNIFF = True
 X_FRAME_OPTIONS = "DENY"
@@ -105,6 +122,7 @@ CORS_ALLOWED_ORIGINS = [
     ).split(",")
     if origin.strip()
 ]
+CORS_ALLOW_HEADERS = [*default_headers, "idempotency-key"]
 
 LANGUAGE_CODE = "en-us"
 TIME_ZONE = "Asia/Colombo"
