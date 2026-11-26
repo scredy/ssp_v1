@@ -201,7 +201,7 @@ class StaffEnquiryDetailView(APIView):
 
     def patch(self, request, enquiry_id):
         with transaction.atomic():
-            enquiry = get_object_or_404(Enquiry.objects.select_for_update().select_related("customer", "vehicle"), pk=enquiry_id)
+            enquiry = get_object_or_404(Enquiry.objects.select_for_update(of=("self",)).select_related("customer", "vehicle"), pk=enquiry_id)
             old_status = enquiry.status
             old_scheduled_at = enquiry.scheduled_at
             previously_emailed = enquiry.confirmation_email_status == Enquiry.ConfirmationEmailStatus.SENT
@@ -231,7 +231,7 @@ class StaffEnquiryConfirmationRetryView(APIView):
 
     def post(self, request, enquiry_id):
         with transaction.atomic():
-            enquiry = get_object_or_404(Enquiry.objects.select_for_update().select_related("customer", "vehicle"), pk=enquiry_id)
+            enquiry = get_object_or_404(Enquiry.objects.select_for_update(of=("self",)).select_related("customer", "vehicle"), pk=enquiry_id)
             if (enquiry.status != Enquiry.Status.SCHEDULED
                     or enquiry.kind not in (Enquiry.Kind.APPOINTMENT, Enquiry.Kind.TEST_DRIVE)
                     or not enquiry.scheduled_at):
@@ -1199,6 +1199,14 @@ class StaffDashboardSummaryView(APIView):
         }
         if request.user.role == User.Role.CEO:
             payload["pending_bl_approvals"] = BLApprovalRequest.objects.filter(status=BLApprovalRequest.Status.PENDING).count()
+        if request.user.role in {User.Role.CEO, User.Role.MANAGER}:
+            payment_totals = Payment.objects.aggregate(
+                verified_count=Count("pk", filter=Q(status=Payment.Status.VERIFIED)),
+                verified_amount_lkr=Sum("amount_lkr", filter=Q(status=Payment.Status.VERIFIED)),
+                pending_count=Count("pk", filter=Q(status=Payment.Status.PENDING)),
+            )
+            payment_totals["verified_amount_lkr"] = payment_totals["verified_amount_lkr"] or Decimal("0.00")
+            payload["payments"] = payment_totals
         return Response(payload)
 
 
@@ -1428,7 +1436,7 @@ class HandoverMDApprovalView(APIView):
 
     def post(self, request, reference):
         with transaction.atomic():
-            handover = get_object_or_404(Handover.objects.select_for_update().select_related("sale__reservation"), reference=reference)
+            handover = get_object_or_404(Handover.objects.select_for_update(of=("self",)).select_related("sale__reservation"), reference=reference)
             if handover.status != Handover.Status.PENDING_MD_REVIEW:
                 return Response({"detail": "Only handovers pending MD review can be approved by the MD."}, status=status.HTTP_409_CONFLICT)
             errors = _handover_readiness_errors(handover)
@@ -1452,10 +1460,10 @@ class HandoverCEOApprovalView(APIView):
 
     def post(self, request, reference):
         with transaction.atomic():
-            handover = get_object_or_404(Handover.objects.select_for_update().select_related("sale__reservation"), reference=reference)
+            handover = get_object_or_404(Handover.objects.select_for_update(of=("self",)).select_related("sale__reservation"), reference=reference)
             if handover.status != Handover.Status.PENDING_CEO_APPROVAL or not handover.md_approved_by_id or not handover.md_approved_at:
                 return Response({"detail": "CEO approval requires a recorded MD approval."}, status=status.HTTP_409_CONFLICT)
-            sale = Sale.objects.select_for_update().select_related("reservation").get(pk=handover.sale_id)
+            sale = Sale.objects.select_for_update(of=("self",)).select_related("reservation").get(pk=handover.sale_id)
             vehicle = Vehicle.objects.select_for_update().get(pk=handover.vehicle_id)
             import_order = ImportOrder.objects.select_for_update().get(pk=sale.import_order_id) if sale.import_order_id else None
             errors = _handover_release_errors(handover, sale, vehicle, import_order)
@@ -1482,7 +1490,7 @@ class HandoverReturnView(APIView):
         serializer.is_valid(raise_exception=True)
         comments = serializer.validated_data["comments"]
         with transaction.atomic():
-            handover = get_object_or_404(Handover.objects.select_for_update().select_related("md_approved_by"), reference=reference)
+            handover = get_object_or_404(Handover.objects.select_for_update(of=("self",)).select_related("md_approved_by"), reference=reference)
             before = handover.status
             if request.user.role == User.Role.MANAGER and before in {Handover.Status.PENDING_MD_REVIEW, Handover.Status.CEO_APPROVED}:
                 after = Handover.Status.PREPARING

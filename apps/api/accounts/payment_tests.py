@@ -51,7 +51,7 @@ class PaymentApiTests(APITestCase):
         return self.client.post("/api/staff/payments/", data, format="json")
 
     def make_import(self, user=None, customer=None):
-        self.client.force_authenticate(user or self.manager)
+        self.client.force_authenticate(user or self.staff)
         return self.client.post("/api/staff/imports/", {"customer_id": (customer or self.customer).pk,
             "vehicle_description": "Toyota import order", "country_of_origin": "Japan"}, format="json")
 
@@ -60,7 +60,7 @@ class PaymentApiTests(APITestCase):
             "method": "bank_transfer", "transaction_reference": transaction_reference, "funds_cleared": True, "payment_date": "2026-11-21"})
 
     def test_import_payment_without_vehicle_verification_summary_and_milestone(self):
-        created = self.make_import()
+        created = self.make_import(self.staff)
         self.assertEqual(created.status_code, status.HTTP_201_CREATED)
         order = ImportOrder.objects.get(reference=created.data["reference"])
         self.assertIsNone(order.vehicle_id)
@@ -71,17 +71,17 @@ class PaymentApiTests(APITestCase):
         self.client.force_authenticate(self.staff)
         summary = self.client.get(f"/api/staff/imports/{order.reference}/payments/summary/")
         self.assertEqual(Decimal(summary.data["verified_amount_lkr"]), Decimal("125.50"))
-        self.assertNotIn("outstanding_balance_lkr", summary.data)
+        self.assertIsNone(summary.data["outstanding_balance_lkr"])
         milestone = self.client.post(f"/api/staff/imports/{order.reference}/milestones/", {
             "kind": "payment_verified", "payment_reference": response.data["reference"],
             "customer_description": "A payment for this import has been verified."}, format="json")
         self.assertEqual(milestone.status_code, status.HTTP_201_CREATED)
 
     def test_import_payment_permissions_customer_consistency_and_no_double_count(self):
-        created = self.make_import()
+        created = self.make_import(self.staff)
         order = ImportOrder.objects.get(reference=created.data["reference"])
-        self.client.force_authenticate(self.ceo)
-        denied = self.import_payment(order.reference, "IMPORT-CEO-DENIED", self.ceo)
+        self.client.force_authenticate(self.staff)
+        denied = self.import_payment(order.reference, "IMPORT-STAFF-DENIED", self.staff)
         self.assertEqual(denied.status_code, status.HTTP_403_FORBIDDEN)
         self.client.force_authenticate(self.manager)
         payment = self.import_payment(order.reference, "IMPORT-PAYMENT-REJECT", self.manager)
@@ -109,7 +109,8 @@ class PaymentApiTests(APITestCase):
         self.assertEqual(good.data["status"], Payment.Status.VERIFIED)
         order.vehicle = self.vehicle
         order.save(update_fields=["vehicle"])
-        sale = Sale.objects.create(vehicle=self.vehicle, customer=self.customer, agreed_price_lkr=Decimal("1000.00"), created_by=self.manager)
+        sale = Sale.objects.create(vehicle=self.vehicle, customer=self.customer, import_order=order,
+            agreed_price_lkr=Decimal("1000.00"), created_by=self.manager)
         import_summary = self.client.get(f"/api/staff/imports/{order.reference}/payments/summary/")
         sale_summary = self.client.get(f"/api/manager/sales/{sale.reference}/payments/summary/")
         self.assertEqual(Decimal(import_summary.data["verified_amount_lkr"]), Decimal("125.50"))
@@ -231,7 +232,8 @@ class PaymentApiTests(APITestCase):
     def test_payment_evidence_is_stored_privately_and_authorized_download_is_required(self):
         self.client.force_authenticate(self.manager)
         proof = SimpleUploadedFile("proof.pdf", b"%PDF-1.4\nprivate evidence\n%%EOF", content_type="application/pdf")
-        response = self.client.post("/api/staff/payments/", {**self.sale_payload(transaction_reference="BANK-EVIDENCE-008"), "evidence": proof}, format="multipart")
+        response = self.client.post("/api/staff/payments/", {**self.sale_payload(transaction_reference="BANK-EVIDENCE-008",
+            idempotency_key="payment-evidence-test-008"), "evidence": proof}, format="multipart")
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         payment = Payment.objects.get(reference=response.data["reference"])
         self.assertTrue(payment.evidence.name)

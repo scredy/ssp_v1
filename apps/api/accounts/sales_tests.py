@@ -75,20 +75,21 @@ class SalesApiTests(APITestCase):
         reservation = Reservation.objects.get(reference=reserved.data["reference"])
         self.assertEqual(reservation.customer_id, customer_id)
 
-        pending = self.client.post("/api/staff/payments/", {"reservation_reference": reservation.reference,
-            "amount_lkr": "250.00", "method": "bank_transfer", "transaction_reference": "FICTIONAL-TRANSFER-PENDING",
-            "payment_date": "2026-11-21"}, format="json")
-        verified = self.client.post("/api/staff/payments/", {"reservation_reference": reservation.reference,
-            "amount_lkr": "250.00", "method": "cash", "transaction_reference": "FICTIONAL-CASH-VERIFIED",
-            "payment_date": "2026-11-21"}, format="json")
-        self.assertEqual(pending.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(verified.status_code, status.HTTP_201_CREATED)
         self.client.force_authenticate(self.manager)
-        self.assertEqual(self.client.post(f"/api/staff/payments/{verified.data['reference']}/verify/", {}, format="json").status_code,
-                         status.HTTP_200_OK)
+        first_payment = self.client.post("/api/staff/payments/", {"reservation_reference": reservation.reference,
+            "amount_lkr": "250.00", "method": "bank_transfer", "transaction_reference": "FICTIONAL-TRANSFER-CLEARED",
+            "funds_cleared": True, "idempotency_key": "reservation-transfer-cleared-001",
+            "payment_date": "2026-11-21"}, format="json")
+        second_payment = self.client.post("/api/staff/payments/", {"reservation_reference": reservation.reference,
+            "amount_lkr": "250.00", "method": "cash", "transaction_reference": "FICTIONAL-CASH-RECEIVED",
+            "idempotency_key": "reservation-cash-received-001", "payment_date": "2026-11-21"}, format="json")
+        self.assertEqual(first_payment.status_code, status.HTTP_201_CREATED, first_payment.data)
+        self.assertEqual(second_payment.status_code, status.HTTP_201_CREATED, second_payment.data)
+        self.assertEqual(first_payment.data["status"], Payment.Status.VERIFIED)
+        self.assertEqual(second_payment.data["status"], Payment.Status.VERIFIED)
         before_sale = self.client.get(f"/api/staff/reservations/{reservation.reference}/payments/summary/")
-        self.assertEqual(before_sale.data["verified_received_lkr"], Decimal("250.00"))
-        self.assertEqual(before_sale.data["pending_verification_lkr"], Decimal("250.00"))
+        self.assertEqual(before_sale.data["verified_received_lkr"], Decimal("500.00"))
+        self.assertEqual(before_sale.data["pending_verification_lkr"], Decimal("0.00"))
 
         rep_user = User.objects.create_user(username="sale-assigned-rep", password="Test-pass-912!", role=User.Role.REP)
         rep = RepresentativeProfile.objects.create(user=rep_user)
@@ -120,22 +121,22 @@ class SalesApiTests(APITestCase):
         self.assertEqual(self.vehicle.status, Vehicle.Status.SOLD)
         self.assertEqual(reservation.status, Reservation.Status.CONVERTED)
         summary = self.client.get(f"/api/manager/sales/{draft.data['reference']}/payments/summary/")
-        self.assertEqual(summary.data["verified_received_lkr"], Decimal("250.00"))
-        self.assertEqual(summary.data["pending_verification_lkr"], Decimal("250.00"))
-        self.assertEqual(summary.data["outstanding_balance_lkr"], Decimal("650.00"))
+        self.assertEqual(summary.data["verified_received_lkr"], Decimal("500.00"))
+        self.assertEqual(summary.data["pending_verification_lkr"], Decimal("0.00"))
+        self.assertEqual(summary.data["outstanding_balance_lkr"], Decimal("400.00"))
         self.client.force_authenticate(self.staff)
         eligible = self.client.get("/api/staff/handovers/eligible-sales/?search=" + draft.data["reference"])
         self.assertEqual(eligible.status_code, status.HTTP_200_OK)
         self.assertEqual([item["reference"] for item in eligible.data], [draft.data["reference"]])
         prepared = self.client.post("/api/staff/handovers/", {"sale_reference": draft.data["reference"],
-            "internal_notes": "Manager approved delivery with LKR 650.00 outstanding; balance due by agreement."}, format="json")
+            "internal_notes": "Manager approved delivery with LKR 400.00 outstanding; balance due by agreement."}, format="json")
         self.assertEqual(prepared.status_code, status.HTTP_201_CREATED)
         self.assertEqual(self.client.post("/api/staff/handovers/", {"sale_reference": draft.data["reference"]}, format="json").status_code,
                          status.HTTP_409_CONFLICT)
-        self.assertEqual(prepared.data["financial_summary"]["verified_received_lkr"], Decimal("250.00"))
-        self.assertEqual(prepared.data["financial_summary"]["pending_verification_lkr"], Decimal("250.00"))
-        self.assertEqual(prepared.data["financial_summary"]["outstanding_balance_lkr"], Decimal("650.00"))
-        self.assertEqual(prepared.data["internal_notes"], "Manager approved delivery with LKR 650.00 outstanding; balance due by agreement.")
+        self.assertEqual(prepared.data["financial_summary"]["verified_received_lkr"], Decimal("500.00"))
+        self.assertEqual(prepared.data["financial_summary"]["pending_verification_lkr"], Decimal("0.00"))
+        self.assertEqual(prepared.data["financial_summary"]["outstanding_balance_lkr"], Decimal("400.00"))
+        self.assertEqual(prepared.data["internal_notes"], "Manager approved delivery with LKR 400.00 outstanding; balance due by agreement.")
         handover_url = f"/api/staff/handovers/{prepared.data['reference']}/"
         checklist = {key: True for key in ("bodywork", "interior", "tyres", "lights", "odometer")}
         documents = {key: True for key in ("keys", "registration_documents", "insurance_documents", "service_documents")}
@@ -151,16 +152,11 @@ class SalesApiTests(APITestCase):
         md_approval = self.client.post(f"{handover_url}approve-md/", {"comments": "Preparation reviewed."}, format="json")
         self.assertEqual(md_approval.status_code, status.HTTP_200_OK)
         self.client.force_authenticate(self.ceo)
-        self.assertEqual(self.client.post(f"{handover_url}approve-ceo/", {"comments": "Handover approved."}, format="json").status_code,
-                         status.HTTP_409_CONFLICT)
+        ceo_approval = self.client.post(f"{handover_url}approve-ceo/", {"comments": "Handover approved."}, format="json")
+        self.assertEqual(ceo_approval.status_code, status.HTTP_200_OK, ceo_approval.data)
         self.client.force_authenticate(self.manager)
-        self.assertEqual(self.client.post(f"/api/staff/payments/{pending.data['reference']}/verify/", {}, format="json").status_code,
-                         status.HTTP_200_OK)
         self.assertEqual(self.client.get(f"/api/manager/sales/{draft.data['reference']}/payments/summary/").data[
             "outstanding_balance_lkr"], Decimal("400.00"))
-        self.client.force_authenticate(self.ceo)
-        ceo_approval = self.client.post(f"{handover_url}approve-ceo/", {"comments": "Handover approved."}, format="json")
-        self.assertEqual(ceo_approval.status_code, status.HTTP_200_OK)
         self.client.force_authenticate(self.manager)
         finalized = self.client.post(f"{handover_url}finalize/", {}, format="json")
         self.assertEqual(finalized.status_code, status.HTTP_200_OK)
