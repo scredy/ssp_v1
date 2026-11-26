@@ -29,7 +29,7 @@ python manage.py createsuperuser
 python manage.py runserver localhost:8000
 ```
 
-The API loads PostgreSQL settings from the ignored repository-root `.env`; Django-only settings come from `apps/api/.env`. The health endpoint is `http://localhost:8000/api/health/`.
+The API loads PostgreSQL settings from the ignored repository-root `.env`; Django-only settings come from `apps/api/.env`. The database-aware readiness endpoint is `http://localhost:8000/healthz` (the existing `api/health/` endpoint remains available).
 
 In a separate frontend terminal, from the repository root:
 
