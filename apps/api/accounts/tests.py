@@ -1,6 +1,7 @@
 from decimal import Decimal
 from django.conf import settings
 from django.db import DatabaseError
+from django.test import override_settings
 from unittest.mock import patch
 
 from django.urls import reverse
@@ -8,9 +9,25 @@ from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 
 from .models import User, Vehicle
+from config.settings import _get_allowed_hosts
 
 
 class AccountApiTests(APITestCase):
+    def test_render_external_hostname_is_added_without_replacing_custom_hosts(self):
+        hosts = _get_allowed_hosts({
+            "DJANGO_ALLOWED_HOSTS": "ssp.example.com, admin.ssp.example.com",
+            "RENDER_EXTERNAL_HOSTNAME": "ssp-api.onrender.com",
+        })
+        self.assertEqual(hosts, ["ssp.example.com", "admin.ssp.example.com", "ssp-api.onrender.com"])
+
+    def test_render_external_hostname_is_not_duplicated_or_wildcarded(self):
+        hosts = _get_allowed_hosts({
+            "DJANGO_ALLOWED_HOSTS": "ssp-api.onrender.com",
+            "RENDER_EXTERNAL_HOSTNAME": "ssp-api.onrender.com",
+        })
+        self.assertEqual(hosts, ["ssp-api.onrender.com"])
+        self.assertNotIn("*", hosts)
+
     def make_user(self, username, role, password="Valid-password-914!"):
         return User.objects.create_user(username=username, password=password, email=f"{username}@example.test",
                                         role=role)
@@ -23,6 +40,41 @@ class AccountApiTests(APITestCase):
         response = self.client.get("/healthz")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.json(), {"status": "ok"})
+
+    def test_healthz_returns_200_for_allowed_render_hostname_with_database(self):
+        render_hosts = _get_allowed_hosts({
+            "DJANGO_ALLOWED_HOSTS": "ssp.example.com",
+            "RENDER_EXTERNAL_HOSTNAME": "ssp-api.onrender.com",
+        })
+        with override_settings(ALLOWED_HOSTS=render_hosts):
+            response = self.client.get("/healthz", HTTP_HOST="ssp-api.onrender.com")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json(), {"status": "ok"})
+
+    @override_settings(
+        ALLOWED_HOSTS=["ssp-api.onrender.com"],
+        SECURE_SSL_REDIRECT=True,
+        SECURE_PROXY_SSL_HEADER=("HTTP_X_FORWARDED_PROTO", "https"),
+    )
+    def test_healthz_recognizes_render_forwarded_https(self):
+        response = self.client.get(
+            "/healthz",
+            HTTP_HOST="ssp-api.onrender.com",
+            HTTP_X_FORWARDED_PROTO="https",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    @override_settings(ALLOWED_HOSTS=["ssp-api.onrender.com"])
+    def test_disallowed_host_is_logged_without_logging_request_query(self):
+        with self.assertLogs("django.security.DisallowedHost", level="WARNING") as logs:
+            response = self.client.get(
+                "/healthz?access_token=private-value",
+                HTTP_HOST="unexpected.example.net",
+            )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        rendered_log = "\n".join(logs.output)
+        self.assertIn("unexpected.example.net", rendered_log)
+        self.assertNotIn("private-value", rendered_log)
 
     @patch("config.urls.connection.cursor", side_effect=DatabaseError("private database detail"))
     def test_healthz_returns_generic_unavailable_when_database_is_down(self, _cursor):
