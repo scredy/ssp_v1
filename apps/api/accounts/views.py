@@ -5,6 +5,7 @@ from django.core.mail import send_mail
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import IntegrityError, transaction
 from django.db.models import Count, Prefetch, Q, Sum
+from django.db.models.functions import TruncDate
 from django.http import FileResponse, HttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -28,9 +29,10 @@ from rest_framework.pagination import LimitOffsetPagination
 from rest_framework.views import APIView
 
 from .models import (AccountActionToken, AuditEvent, BLApprovalRequest, CommissionLedgerEntry, CommissionRule, Customer, Enquiry, ImportMilestone,
-                     HANDOVER_CONDITION_CHECKLIST, HANDOVER_KEYS_DOCUMENTS_CHECKLIST, Handover, HandoverDocumentReceipt, ImportOrder,
+                     HANDOVER_CONDITION_CHECKLIST, HANDOVER_KEYS_DOCUMENTS_CHECKLIST, Handover, HandoverApproval, HandoverDocumentReceipt, ImportOrder,
                      ImportTrackingAccess, Notification, Payment, Quotation, RepresentativeProfile, Reservation, Sale,
                      User, Vehicle, VehiclePhoto)
+from .appointment_email import queue_confirmation_email, send_confirmation_email, valid_customer_email
 from .permissions import CommissionLedgerAccess, CustomerAccess, HasCapability, HandoverAccess, ImportAccess, InventoryAccess, PaymentAccess, QuotationAccess, RepresentativeDirectoryAccess, ReservationAccess, SalesAccess
 from .serializers import (AccountSerializer, AccountSummarySerializer, AccountUpdateSerializer, CurrentUserSerializer,
                           NotificationReadSerializer, NotificationSerializer, PasswordResetRequestSerializer, PasswordSetupSerializer,
@@ -42,7 +44,7 @@ from .serializers import ReservationCreateSerializer, ReservationReleaseSerializ
 from .serializers import SaleCreateSerializer, SaleSerializer
 from .serializers import PaymentCreateSerializer, PaymentRejectSerializer, PaymentSerializer
 from .serializers import QuotationDraftSerializer, QuotationSerializer
-from .serializers import HandoverDocumentReceiptSerializer, HandoverPreparationSerializer, HandoverSerializer
+from .serializers import HandoverDecisionSerializer, HandoverDocumentReceiptSerializer, HandoverPreparationSerializer, HandoverSerializer
 from .quotation_pdf import build_quotation_pdf
 from .handover_document_receipt_pdf import build_handover_document_receipt_pdf
 from .payment_summaries import sale_payment_summary
@@ -78,10 +80,10 @@ def notify_active_roles(roles, event_key, title, message, target_url, exclude_us
 
 
 def latest_handover_submitter(handover):
-    submission = AuditEvent.objects.filter(
-        action="handover.submitted_for_review", subject=handover.reference,
-    ).select_related("actor").order_by("-created_at", "-pk").first()
-    return submission.actor if submission and submission.actor_id else handover.prepared_by
+    submission = handover.approval_history.filter(
+        decision=HandoverApproval.Decision.SUBMITTED_FOR_MD,
+    ).select_related("reviewer").order_by("-created_at", "-pk").first()
+    return submission.reviewer if submission else handover.prepared_by
 
 
 def notify_handover_outcome(handover, event_kind, actor, event_id, submitter=None):
@@ -95,6 +97,23 @@ def notify_handover_outcome(handover, event_kind, actor, event_id, submitter=Non
     message = (f"Handover {handover.reference} was returned for updates." if event_kind == "returned"
                else f"Handover {handover.reference} was finalized.")
     create_notifications(recipients, event_key, title, message, "/staff/handovers")
+
+
+def record_handover_decision(handover, actor, decision, status_before, status_after, comments="", audit_action=None, audit_details=None):
+    approval = HandoverApproval.objects.create(
+        handover=handover, reviewer=actor, reviewer_role=actor.role, decision=decision,
+        status_before=status_before, status_after=status_after, comments=comments,
+    )
+    event = AuditEvent.objects.create(actor=actor, action=audit_action or f"handover.{decision}",
+        subject=handover.reference, details=audit_details or {
+            "status_before": status_before, "status_after": status_after, "decision": decision,
+        })
+    return approval, event
+
+
+def notify_handover_role(roles, handover, approval, title, message, exclude_user_ids=()):
+    notify_active_roles(roles, f"handover:{handover.pk}:approval:{approval.pk}", title, message,
+        "/staff/handovers", exclude_user_ids=exclude_user_ids)
 
 class PublicEnquiryView(APIView):
     authentication_classes = []
@@ -181,13 +200,63 @@ class StaffEnquiryDetailView(APIView):
     required_capability = "enquiries.manage"
 
     def patch(self, request, enquiry_id):
-        enquiry = get_object_or_404(Enquiry.objects.select_related("customer", "vehicle"), pk=enquiry_id)
-        old_status = enquiry.status
-        serializer = StaffEnquirySerializer(enquiry, data=request.data, partial=True)
-        serializer.is_valid(raise_exception=True)
-        enquiry = serializer.save()
-        AuditEvent.objects.create(actor=request.user, action="enquiry.updated", subject=enquiry.reference,
-            details={"status_from": old_status, "status_to": enquiry.status, "notes_changed": "internal_notes" in request.data, "scheduled": "scheduled_at" in request.data})
+        with transaction.atomic():
+            enquiry = get_object_or_404(Enquiry.objects.select_for_update().select_related("customer", "vehicle"), pk=enquiry_id)
+            old_status = enquiry.status
+            old_scheduled_at = enquiry.scheduled_at
+            previously_emailed = enquiry.confirmation_email_status == Enquiry.ConfirmationEmailStatus.SENT
+            serializer = StaffEnquirySerializer(enquiry, data=request.data, partial=True)
+            serializer.is_valid(raise_exception=True)
+            enquiry = serializer.save()
+            schedule_ready = (
+                enquiry.status == Enquiry.Status.SCHEDULED
+                and enquiry.kind in (Enquiry.Kind.APPOINTMENT, Enquiry.Kind.TEST_DRIVE)
+                and enquiry.scheduled_at is not None
+            )
+            schedule_changed = old_scheduled_at != enquiry.scheduled_at
+            should_send_confirmation = schedule_ready and (old_status != Enquiry.Status.SCHEDULED or schedule_changed)
+            if should_send_confirmation:
+                queue_confirmation_email(enquiry, request.user.pk,
+                                         updated=previously_emailed or old_status == Enquiry.Status.SCHEDULED)
+            AuditEvent.objects.create(actor=request.user, action="enquiry.updated", subject=enquiry.reference,
+                details={"status_from": old_status, "status_to": enquiry.status, "notes_changed": "internal_notes" in request.data,
+                         "scheduled": "scheduled_at" in request.data, "schedule_changed": schedule_changed})
+        enquiry.refresh_from_db()
+        return Response(StaffEnquirySerializer(enquiry).data)
+
+
+class StaffEnquiryConfirmationRetryView(APIView):
+    permission_classes = [HasCapability]
+    required_capability = "enquiries.manage"
+
+    def post(self, request, enquiry_id):
+        with transaction.atomic():
+            enquiry = get_object_or_404(Enquiry.objects.select_for_update().select_related("customer", "vehicle"), pk=enquiry_id)
+            if (enquiry.status != Enquiry.Status.SCHEDULED
+                    or enquiry.kind not in (Enquiry.Kind.APPOINTMENT, Enquiry.Kind.TEST_DRIVE)
+                    or not enquiry.scheduled_at):
+                raise ValidationError({"detail": "Only scheduled appointments and test drives can have a confirmation email retried."})
+            if (enquiry.confirmation_email_status not in (Enquiry.ConfirmationEmailStatus.FAILED,
+                                                          Enquiry.ConfirmationEmailStatus.NO_EMAIL)
+                    or enquiry.confirmation_email_schedule != enquiry.scheduled_at):
+                raise ValidationError({"detail": "Only an unsent or failed email for the current confirmed time can be retried."})
+            recipient = valid_customer_email(enquiry.customer.email)
+            if not recipient:
+                enquiry.confirmation_email_status = Enquiry.ConfirmationEmailStatus.NO_EMAIL
+                enquiry.confirmation_email_recipient = ""
+                enquiry.confirmation_email_error = "Customer record has no valid email address."
+                enquiry.save(update_fields=("confirmation_email_status", "confirmation_email_recipient", "confirmation_email_error"))
+            else:
+                enquiry.confirmation_email_status = Enquiry.ConfirmationEmailStatus.QUEUED
+                enquiry.confirmation_email_recipient = recipient
+                enquiry.confirmation_email_error = ""
+                enquiry.confirmation_email_sent_at = None
+                enquiry.save(update_fields=("confirmation_email_status", "confirmation_email_recipient", "confirmation_email_error", "confirmation_email_sent_at"))
+                enquiry_id = enquiry.pk
+                scheduled_at = enquiry.scheduled_at
+                actor_id = request.user.pk
+                transaction.on_commit(lambda: send_confirmation_email(enquiry_id, scheduled_at, actor_id))
+        enquiry.refresh_from_db()
         return Response(StaffEnquirySerializer(enquiry).data)
 
 
@@ -330,16 +399,74 @@ class NotificationPagination(LimitOffsetPagination):
     max_limit = 100
 
 
+# Notifications do not have a stored category field. Classify the event strings and
+# destinations already emitted by the workflow; leave unrelated events in All only.
+HANDOVER_NOTIFICATION_Q = (Q(target_url__startswith="/staff/handovers") |
+                           Q(title__icontains="handover") | Q(message__icontains="handover"))
+PAYMENT_NOTIFICATION_Q = (Q(target_url__startswith="/staff/payments") |
+                          Q(title__icontains="payment") | Q(message__icontains="payment"))
+BL_APPROVAL_NOTIFICATION_Q = (Q(target_url__startswith="/staff/bl-requests") |
+                              Q(title__icontains="BL approval") | Q(message__icontains="BL approval"))
+HANDOVER_APPROVAL_NOTIFICATION_Q = HANDOVER_NOTIFICATION_Q & (
+    Q(title__icontains="review") | Q(message__icontains="review") |
+    Q(title__icontains="approval") | Q(message__icontains="approval") |
+    Q(title__icontains="approved") | Q(message__icontains="approved") |
+    Q(title__icontains="returned") | Q(message__icontains="returned") |
+    Q(title__icontains="return") | Q(message__icontains="return"))
+APPROVAL_NOTIFICATION_Q = (PAYMENT_NOTIFICATION_Q | BL_APPROVAL_NOTIFICATION_Q |
+                            HANDOVER_APPROVAL_NOTIFICATION_Q)
+SYSTEM_NOTIFICATION_Q = (Q(deduplication_key__istartswith="system:") |
+                         Q(title__icontains="system") | Q(message__icontains="system"))
+
+
 class NotificationCollectionView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
         notifications = Notification.objects.filter(recipient=request.user).order_by("-created_at", "-pk")
-        unread_count = notifications.filter(read_at__isnull=True).count()
+        stats = notifications.aggregate(
+            all_count=Count("pk"),
+            unread_count=Count("pk", filter=Q(read_at__isnull=True)),
+            approval_count=Count("pk", filter=APPROVAL_NOTIFICATION_Q),
+            handover_count=Count("pk", filter=HANDOVER_NOTIFICATION_Q),
+            system_count=Count("pk", filter=SYSTEM_NOTIFICATION_Q),
+        )
+        filtered = notifications
+        search = request.query_params.get("search", "").strip()[:100]
+        if search:
+            filtered = filtered.filter(Q(title__icontains=search) | Q(message__icontains=search) |
+                                       Q(target_url__icontains=search))
+        category = request.query_params.get("category", "all")
+        if category == "approvals":
+            filtered = filtered.filter(APPROVAL_NOTIFICATION_Q)
+        elif category == "handovers":
+            filtered = filtered.filter(HANDOVER_NOTIFICATION_Q)
+        elif category == "system":
+            filtered = filtered.filter(SYSTEM_NOTIFICATION_Q)
+        elif category == "unread":
+            filtered = filtered.filter(read_at__isnull=True)
+        elif category != "all":
+            return Response({"detail": "Choose a valid notification category."}, status=status.HTTP_400_BAD_REQUEST)
+        is_read = request.query_params.get("is_read")
+        if is_read in ("true", "false"):
+            filtered = filtered.filter(read_at__isnull=(is_read == "false"))
+        period = request.query_params.get("period", "all")
+        if period in ("today", "7d", "30d"):
+            days_back = {"today": 0, "7d": 6, "30d": 29}[period]
+            local_start = timezone.localdate() - timedelta(days=days_back)
+            start = timezone.make_aware(datetime.combine(local_start, time.min), timezone.get_current_timezone())
+            filtered = filtered.filter(created_at__gte=start)
+        elif period != "all":
+            return Response({"detail": "Choose a valid notification date range."}, status=status.HTTP_400_BAD_REQUEST)
         paginator = NotificationPagination()
-        page = paginator.paginate_queryset(notifications, request, view=self)
+        page = paginator.paginate_queryset(filtered, request, view=self)
         response = paginator.get_paginated_response(NotificationSerializer(page, many=True).data)
-        response.data["unread_count"] = unread_count
+        response.data["unread_count"] = stats["unread_count"]
+        response.data["category_counts"] = {
+            "all": stats["all_count"], "unread": stats["unread_count"],
+            "approvals": stats["approval_count"], "handovers": stats["handover_count"],
+            "system": stats["system_count"],
+        }
         return response
 
 
@@ -548,7 +675,8 @@ AUDIT_SAFE_DETAIL_FIELDS = {
     "account.activated": ("is_active", "activation_method"),
     "account.deactivated": ("is_active",),
     "account.role_changed": ("role_from", "role_to"),
-    "enquiry.updated": ("status_from", "status_to", "notes_changed", "scheduled"),
+    "enquiry.updated": ("status_from", "status_to", "notes_changed", "scheduled", "schedule_changed"),
+    "enquiry.confirmation_email": ("status", "scheduled_at"),
     "commission.approved": ("previous_status", "status"),
     "commission.paid": ("previous_status", "status", "payout_date", "payout_amount_lkr"),
     "commission.reversed": ("previous_status", "status"),
@@ -560,8 +688,11 @@ AUDIT_SAFE_DETAIL_FIELDS = {
     "sale.confirmed": ("vehicle_reference", "reservation_reference"),
     "handover.prepared": ("sale_reference", "vehicle_reference"),
     "handover.updated": ("returned_to_preparing",),
-    "handover.submitted_for_review": ("sale_reference",),
-    "handover.finalized": ("sale_reference", "vehicle_reference", "outstanding_balance_lkr", "balance_review_required"),
+    "handover.submitted_for_review": ("sale_reference", "status_before", "status_after"),
+    "handover.md_approved": ("status_before", "status_after", "decision"),
+    "handover.ceo_approved": ("status_before", "status_after", "decision"),
+    "handover.returned": ("status_before", "status_after", "decision", "reason_recorded"),
+    "handover.finalized": ("sale_reference", "vehicle_reference", "outstanding_balance_lkr", "balance_review_required", "status_before", "status_after"),
     "payment.recorded": ("status", "method", "sale_reference", "reservation_reference", "import_reference", "evidence_attached"),
     "payment.verified": ("sale_reference", "reservation_reference", "import_reference"),
     "quotation.created": ("status",),
@@ -1034,6 +1165,43 @@ class SaleSummaryView(APIView):
                          "confirmed_count": sales.filter(status=Sale.Status.CONFIRMED).count()})
 
 
+class StaffDashboardSummaryView(APIView):
+    """Small, role-scoped aggregates for the staff, MD and CEO dashboards."""
+    permission_classes = [SalesAccess]
+    summary_only = True
+
+    def get(self, request):
+        today = timezone.localdate()
+        since = today - timedelta(days=29)
+        since_at = timezone.make_aware(datetime.combine(since, time.min), timezone.get_current_timezone())
+        confirmed_sales = Sale.objects.filter(status=Sale.Status.CONFIRMED)
+        trend = (confirmed_sales.filter(confirmed_at__gte=since_at)
+                 .annotate(day=TruncDate("confirmed_at", tzinfo=timezone.get_current_timezone()))
+                 .values("day").annotate(count=Count("pk")).order_by("day"))
+        payload = {
+            "sales": {
+                "draft_count": Sale.objects.filter(status=Sale.Status.DRAFT).count(),
+                "confirmed_count": confirmed_sales.count(),
+                "confirmed_by_day": [{"date": row["day"].isoformat(), "count": row["count"]} for row in trend],
+            },
+            "inventory": {row["status"]: row["count"] for row in Vehicle.objects.values("status").annotate(count=Count("pk"))},
+            "reservations": {
+                "active_count": Reservation.objects.filter(status=Reservation.Status.ACTIVE).count(),
+                "released_count": Reservation.objects.filter(status=Reservation.Status.RELEASED).count(),
+            },
+            "enquiries": {
+                "pending_count": Enquiry.objects.filter(status__in=(Enquiry.Status.NEW, Enquiry.Status.CONTACTED)).count(),
+                "appointment_count": Enquiry.objects.filter(status__in=(Enquiry.Status.NEW, Enquiry.Status.CONTACTED), kind__in=(Enquiry.Kind.APPOINTMENT, Enquiry.Kind.TEST_DRIVE)).count(),
+            },
+            "quotations": {row["status"]: row["count"] for row in Quotation.objects.values("status").annotate(count=Count("pk"))},
+            "handovers": {row["status"]: row["count"] for row in Handover.objects.values("status").annotate(count=Count("pk"))},
+            "imports": {row["status"]: row["count"] for row in ImportOrder.objects.values("status").annotate(count=Count("pk"))},
+        }
+        if request.user.role == User.Role.CEO:
+            payload["pending_bl_approvals"] = BLApprovalRequest.objects.filter(status=BLApprovalRequest.Status.PENDING).count()
+        return Response(payload)
+
+
 class SaleOptionsView(APIView):
     permission_classes = [SalesAccess]
     options_only = True
@@ -1125,12 +1293,28 @@ def _handover_readiness_errors(handover):
     return errors
 
 
+def _handover_release_errors(handover, sale=None, vehicle=None, import_order=None):
+    errors = _handover_readiness_errors(handover)
+    sale = sale or Sale.objects.select_related("reservation").get(pk=handover.sale_id)
+    vehicle = vehicle or Vehicle.objects.get(pk=handover.vehicle_id)
+    if sale.status != Sale.Status.CONFIRMED or sale.vehicle_id != vehicle.pk or vehicle.status != Vehicle.Status.SOLD:
+        errors["sale"] = "The confirmed sale and sold vehicle state must still match before approval or release."
+    payment_summary = sale_payment_summary(sale)
+    if not payment_summary["down_payment_satisfied"]:
+        errors["payment"] = "The declared reservation down payment must be received and verified before CEO approval or vehicle release."
+    if sale.import_order_id:
+        import_order = import_order or ImportOrder.objects.get(pk=sale.import_order_id)
+        if import_order.status != ImportOrder.Status.READY_FOR_COLLECTION:
+            errors["import_order"] = "The linked import must be ready for collection before approval or release."
+    return errors
+
+
 class HandoverCollectionView(APIView):
     permission_classes = [HandoverAccess]
     handover_action = "collection"
 
     def get(self, request):
-        handovers = Handover.objects.select_related("sale__reservation", "customer", "vehicle", "prepared_by", "finalized_by")
+        handovers = Handover.objects.select_related("sale__reservation", "customer", "vehicle", "prepared_by", "md_approved_by", "ceo_approved_by", "finalized_by").prefetch_related("approval_history__reviewer")
         search = request.query_params.get("search", "").strip()
         state = request.query_params.get("status", "")
         if state in Handover.Status.values:
@@ -1181,17 +1365,17 @@ class HandoverDetailView(APIView):
     handover_action = "detail"
 
     def get(self, request, reference):
-        handover = get_object_or_404(Handover.objects.select_related("sale__reservation", "customer", "vehicle", "prepared_by", "finalized_by"), reference=reference)
+        handover = get_object_or_404(Handover.objects.select_related("sale__reservation", "customer", "vehicle", "prepared_by", "md_approved_by", "ceo_approved_by", "finalized_by").prefetch_related("approval_history__reviewer"), reference=reference)
         return Response(HandoverSerializer(handover).data)
 
     def patch(self, request, reference):
         try:
             with transaction.atomic():
                 handover = get_object_or_404(Handover.objects.select_for_update().select_related("sale"), reference=reference)
-                returning_from_review = handover.status == Handover.Status.READY_FOR_REVIEW
-                submitting_user = latest_handover_submitter(handover) if returning_from_review else None
                 if handover.status == Handover.Status.FINALIZED:
                     return Response({"detail": "Finalized handovers are immutable."}, status=status.HTTP_409_CONFLICT)
+                if handover.status != Handover.Status.PREPARING:
+                    return Response({"detail": "Preparation can only be changed while the handover is in Preparing status. Use the review decision actions to return it for correction."}, status=status.HTTP_409_CONFLICT)
                 serializer = HandoverPreparationSerializer(data=request.data, partial=True)
                 serializer.is_valid(raise_exception=True)
                 data = dict(serializer.validated_data)
@@ -1204,13 +1388,9 @@ class HandoverDetailView(APIView):
                     handover.customer_acknowledged_at = timezone.now()
                 for field, value in data.items():
                     setattr(handover, field, value)
-                if handover.status == Handover.Status.READY_FOR_REVIEW:
-                    handover.status = Handover.Status.PREPARING
                 handover.save()
-                event = AuditEvent.objects.create(actor=request.user, action="handover.updated", subject=handover.reference,
-                    details={"fields": sorted(key for key in data if key != "supporting_evidence"), "returned_to_preparing": True})
-                if returning_from_review:
-                    notify_handover_outcome(handover, "returned", request.user, event.pk, submitter=submitting_user)
+                AuditEvent.objects.create(actor=request.user, action="handover.updated", subject=handover.reference,
+                    details={"fields": sorted(key for key in data if key != "supporting_evidence"), "returned_to_preparing": False})
         except Handover.DoesNotExist:
             return Response({"detail": "Handover not found."}, status=status.HTTP_404_NOT_FOUND)
         return Response(HandoverSerializer(handover).data)
@@ -1229,16 +1409,103 @@ class HandoverSubmitView(APIView):
                 errors = _handover_readiness_errors(handover)
                 if errors:
                     return Response(errors, status=status.HTTP_400_BAD_REQUEST)
-                handover.status = Handover.Status.READY_FOR_REVIEW
+                handover.status = Handover.Status.PENDING_MD_REVIEW
                 handover.save()
-                event = AuditEvent.objects.create(actor=request.user, action="handover.submitted_for_review", subject=handover.reference,
-                    details={"sale_reference": handover.sale.reference})
-                notify_active_roles((User.Role.CEO, User.Role.MANAGER),
-                    f"handover:{handover.pk}:submitted:audit:{event.pk}",
-                    "Handover needs review", f"Handover {handover.reference} is ready for review.",
-                    "/staff/handovers", exclude_user_ids=(request.user.pk,))
+                approval, _ = record_handover_decision(handover, request.user, HandoverApproval.Decision.SUBMITTED_FOR_MD,
+                    Handover.Status.PREPARING, Handover.Status.PENDING_MD_REVIEW, audit_action="handover.submitted_for_review",
+                    audit_details={"sale_reference": handover.sale.reference, "status_before": Handover.Status.PREPARING,
+                                   "status_after": Handover.Status.PENDING_MD_REVIEW})
+                notify_handover_role((User.Role.MANAGER,), handover, approval, "Handover needs MD review",
+                    f"Handover {handover.reference} is ready for MD review.", exclude_user_ids=(request.user.pk,))
         except Handover.DoesNotExist:
             return Response({"detail": "Handover not found."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(HandoverSerializer(handover).data)
+
+
+class HandoverMDApprovalView(APIView):
+    permission_classes = [HandoverAccess]
+    handover_action = "approve_md"
+
+    def post(self, request, reference):
+        with transaction.atomic():
+            handover = get_object_or_404(Handover.objects.select_for_update().select_related("sale__reservation"), reference=reference)
+            if handover.status != Handover.Status.PENDING_MD_REVIEW:
+                return Response({"detail": "Only handovers pending MD review can be approved by the MD."}, status=status.HTTP_409_CONFLICT)
+            errors = _handover_readiness_errors(handover)
+            if errors:
+                return Response(errors, status=status.HTTP_400_BAD_REQUEST)
+            before = handover.status
+            handover.status = Handover.Status.PENDING_CEO_APPROVAL
+            handover.md_approved_by = request.user
+            handover.md_approved_at = timezone.now()
+            handover.save()
+            approval, _ = record_handover_decision(handover, request.user, HandoverApproval.Decision.MD_APPROVED,
+                before, handover.status, audit_action="handover.md_approved")
+            notify_handover_role((User.Role.CEO,), handover, approval, "Handover needs CEO approval",
+                f"Handover {handover.reference} has MD approval and is ready for CEO approval.", exclude_user_ids=(request.user.pk,))
+        return Response(HandoverSerializer(handover).data)
+
+
+class HandoverCEOApprovalView(APIView):
+    permission_classes = [HandoverAccess]
+    handover_action = "approve_ceo"
+
+    def post(self, request, reference):
+        with transaction.atomic():
+            handover = get_object_or_404(Handover.objects.select_for_update().select_related("sale__reservation"), reference=reference)
+            if handover.status != Handover.Status.PENDING_CEO_APPROVAL or not handover.md_approved_by_id or not handover.md_approved_at:
+                return Response({"detail": "CEO approval requires a recorded MD approval."}, status=status.HTTP_409_CONFLICT)
+            sale = Sale.objects.select_for_update().select_related("reservation").get(pk=handover.sale_id)
+            vehicle = Vehicle.objects.select_for_update().get(pk=handover.vehicle_id)
+            import_order = ImportOrder.objects.select_for_update().get(pk=sale.import_order_id) if sale.import_order_id else None
+            errors = _handover_release_errors(handover, sale, vehicle, import_order)
+            if errors:
+                return Response(errors, status=status.HTTP_409_CONFLICT)
+            before = handover.status
+            handover.status = Handover.Status.CEO_APPROVED
+            handover.ceo_approved_by = request.user
+            handover.ceo_approved_at = timezone.now()
+            handover.save()
+            approval, _ = record_handover_decision(handover, request.user, HandoverApproval.Decision.CEO_APPROVED,
+                before, handover.status, audit_action="handover.ceo_approved")
+            create_notifications((handover.md_approved_by,), f"handover:{handover.pk}:approval:{approval.pk}",
+                "Handover approved by CEO", f"Handover {handover.reference} is approved for delivery and MD finalization.", "/staff/handovers")
+        return Response(HandoverSerializer(handover).data)
+
+
+class HandoverReturnView(APIView):
+    permission_classes = [HandoverAccess]
+    handover_action = "return"
+
+    def post(self, request, reference):
+        serializer = HandoverDecisionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        comments = serializer.validated_data["comments"]
+        with transaction.atomic():
+            handover = get_object_or_404(Handover.objects.select_for_update().select_related("md_approved_by"), reference=reference)
+            before = handover.status
+            if request.user.role == User.Role.MANAGER and before in {Handover.Status.PENDING_MD_REVIEW, Handover.Status.CEO_APPROVED}:
+                after = Handover.Status.PREPARING
+                decision = HandoverApproval.Decision.MD_RETURNED
+                recipients = (handover.prepared_by,)
+                title, message = "Handover returned for correction", f"Handover {handover.reference} was returned by the MD. Review the reason and update the preparation."
+            elif request.user.role == User.Role.CEO and before == Handover.Status.PENDING_CEO_APPROVAL and handover.md_approved_by_id:
+                after = Handover.Status.PENDING_MD_REVIEW
+                decision = HandoverApproval.Decision.CEO_RETURNED
+                recipients = (handover.md_approved_by,)
+                title, message = "Handover returned to MD", f"Handover {handover.reference} was returned by the CEO for MD review."
+            else:
+                return Response({"detail": "This handover cannot be returned by your role at its current approval stage."}, status=status.HTTP_409_CONFLICT)
+            handover.status = after
+            handover.md_approved_by = None
+            handover.md_approved_at = None
+            handover.ceo_approved_by = None
+            handover.ceo_approved_at = None
+            handover.save()
+            approval, _ = record_handover_decision(handover, request.user, decision, before, after, comments,
+                audit_action="handover.returned", audit_details={"decision": decision, "status_before": before,
+                    "status_after": after, "reason_recorded": True})
+            create_notifications(recipients, f"handover:{handover.pk}:approval:{approval.pk}", title, message, "/staff/handovers")
         return Response(HandoverSerializer(handover).data)
 
 
@@ -1250,29 +1517,22 @@ class HandoverFinalizeView(APIView):
         try:
             with transaction.atomic():
                 handover = get_object_or_404(Handover.objects.select_for_update(), reference=reference)
-                if handover.status != Handover.Status.READY_FOR_REVIEW:
-                    return Response({"detail": "Only handovers ready for review can be finalized."}, status=status.HTTP_409_CONFLICT)
-                errors = _handover_readiness_errors(handover)
-                if errors:
-                    return Response(errors, status=status.HTTP_400_BAD_REQUEST)
+                if handover.status != Handover.Status.CEO_APPROVED or not handover.md_approved_by_id or not handover.ceo_approved_by_id:
+                    return Response({"detail": "Only CEO-approved handovers with recorded MD and CEO approvals can be finalized by the MD."}, status=status.HTTP_409_CONFLICT)
                 sale = Sale.objects.select_for_update().get(pk=handover.sale_id)
                 vehicle = Vehicle.objects.select_for_update().get(pk=handover.vehicle_id)
-                if sale.status != Sale.Status.CONFIRMED or sale.vehicle_id != vehicle.pk or vehicle.status != Vehicle.Status.SOLD:
-                    return Response({"detail": "The confirmed sale and sold vehicle state must still match before finalization."}, status=status.HTTP_409_CONFLICT)
-                payment_summary = sale_payment_summary(sale)
-                if not payment_summary["down_payment_satisfied"]:
-                    return Response({"detail": "The declared reservation down payment must be received and verified before vehicle release."},
-                                    status=status.HTTP_409_CONFLICT)
+                import_order = ImportOrder.objects.select_for_update().get(pk=sale.import_order_id) if sale.import_order_id else None
+                errors = _handover_release_errors(handover, sale, vehicle, import_order)
+                if errors:
+                    return Response(errors, status=status.HTTP_409_CONFLICT)
+                before = handover.status
                 handover.status = Handover.Status.FINALIZED
                 handover.finalized_by = request.user
                 handover.finalized_at = timezone.now()
                 handover.save()
                 vehicle.status = Vehicle.Status.HANDED_OVER
                 vehicle.save(update_fields=["status", "updated_at"])
-                if sale.import_order_id:
-                    import_order = ImportOrder.objects.select_for_update().get(pk=sale.import_order_id)
-                    if import_order.status != ImportOrder.Status.READY_FOR_COLLECTION:
-                        return Response({"detail": "The linked import is no longer ready for handover."}, status=status.HTTP_409_CONFLICT)
+                if import_order:
                     import_order.status = ImportOrder.Status.HANDED_OVER
                     import_order.save(update_fields=["status", "updated_at"])
                     ImportMilestone.objects.create(import_order=import_order, kind=ImportMilestone.Kind.FINALIZED_HANDOVER,
@@ -1305,10 +1565,11 @@ class HandoverFinalizeView(APIView):
                         details={"handover_reference": handover.reference, "recipient_id": recipient_id,
                                  "rate_status": policy_snapshot["rate_status"], "amount_lkr": str(amount) if amount is not None else None})
                 financial_summary = HandoverSerializer(handover).data["financial_summary"]
-                event = AuditEvent.objects.create(actor=request.user, action="handover.finalized", subject=handover.reference,
-                    details={"sale_reference": sale.reference, "vehicle_reference": vehicle.reference,
+                approval, event = record_handover_decision(handover, request.user, HandoverApproval.Decision.FINALIZED,
+                    before, handover.status, audit_action="handover.finalized", audit_details={"sale_reference": sale.reference, "vehicle_reference": vehicle.reference,
                              "outstanding_balance_lkr": str(financial_summary["outstanding_balance_lkr"]),
-                             "balance_review_required": financial_summary["balance_review_required"]})
+                             "balance_review_required": financial_summary["balance_review_required"],
+                             "status_before": before, "status_after": handover.status})
                 notify_handover_outcome(handover, "finalized", request.user, event.pk)
         except Handover.DoesNotExist:
             return Response({"detail": "Handover not found."}, status=status.HTTP_404_NOT_FOUND)
@@ -1442,26 +1703,47 @@ class PaymentCollectionView(APIView):
                         import_order = ImportOrder.objects.select_for_update().get(reference=import_reference)
                     except ImportOrder.DoesNotExist:
                         return Response({"import_reference": "Import order not found."}, status=status.HTTP_404_NOT_FOUND)
-                payment = Payment(sale=sale, reservation=reservation if reservation_reference else None,
-                    import_order=import_order,
+                    linked_sale_id = Sale.objects.filter(import_order=import_order).values_list("pk", flat=True).first()
+                    if linked_sale_id:
+                        sale = Sale.objects.select_for_update().get(pk=linked_sale_id)
+                scope = Q(sale=sale) if sale else Q(reservation=reservation) if reservation else Q(import_order=import_order)
+                if sale and sale.reservation_id:
+                    scope |= Q(reservation_id=sale.reservation_id)
+                if sale and sale.import_order_id:
+                    scope |= Q(import_order_id=sale.import_order_id)
+                if import_order:
+                    scope |= Q(import_order=import_order)
+                ceiling = sale.agreed_price_lkr if sale else reservation.agreed_price_lkr if reservation else None
+                if ceiling is not None:
+                    received = Payment.objects.filter(scope, status=Payment.Status.VERIFIED).aggregate(total=Sum("amount_lkr"))["total"] or Decimal("0.00")
+                    if received + data["amount_lkr"] > ceiling:
+                        return Response({"amount_lkr": "Payment exceeds the outstanding transaction balance."}, status=status.HTTP_409_CONFLICT)
+                data.update(status=Payment.Status.VERIFIED, verified_by=request.user, verified_at=timezone.now())
+                payment = Payment(sale=sale, reservation=reservation if reservation_reference and not sale else None,
+                    import_order=import_order if not sale else None,
                     recorded_by=request.user, **data)
                 payment.save()
                 evidence_name = payment.evidence.name if payment.evidence else None
                 AuditEvent.objects.create(actor=request.user, action="payment.recorded", subject=payment.reference,
                     details={"status": payment.status, "method": payment.method,
+                             "payment_type": payment.payment_type, "funds_cleared": payment.funds_cleared,
                              "sale_reference": sale.reference if sale else None,
                              "reservation_reference": reservation.reference if reservation_reference else None,
                              "import_reference": import_order.reference if import_order else None,
                              "evidence_attached": bool(payment.evidence)})
-                notify_active_roles((User.Role.CEO, User.Role.MANAGER), f"payment:{payment.pk}:review-requested",
-                    "Payment needs review", f"Payment {payment.reference} is waiting for verification.",
+                notify_active_roles((User.Role.CEO, User.Role.MANAGER), f"payment:{payment.pk}:recorded",
+                    "Payment recorded", f"Payment {payment.reference} was recorded and confirmed.",
                     "/staff/payments", exclude_user_ids=(request.user.pk,))
+                if sale and sale_payment_summary(sale)["outstanding_balance_lkr"] == 0:
+                    notify_active_roles((User.Role.CEO, User.Role.MANAGER), f"payment:{payment.pk}:sale-settled",
+                        "Sale fully settled", f"Sale {sale.reference} has been fully settled.",
+                        "/staff/payments", exclude_user_ids=(request.user.pk,))
         except IntegrityError:
             if evidence_name:
                 payment.evidence.storage.delete(evidence_name)
             elif payment and payment.evidence and payment.evidence.name:
                 payment.evidence.storage.delete(payment.evidence.name)
-            return Response({"detail": "This transaction reference has already been recorded."}, status=status.HTTP_409_CONFLICT)
+            return Response({"detail": "This payment request or transaction reference has already been recorded."}, status=status.HTTP_409_CONFLICT)
         return Response(PaymentSerializer(payment).data, status=status.HTTP_201_CREATED)
 
 
@@ -1470,14 +1752,16 @@ class PaymentDashboardSummaryView(APIView):
 
     def get(self, request):
         totals = Payment.objects.aggregate(
-            pending_count=Count("id", filter=Q(status=Payment.Status.PENDING)),
             verified_count=Count("id", filter=Q(status=Payment.Status.VERIFIED)),
-            rejected_count=Count("id", filter=Q(status=Payment.Status.REJECTED)),
-            pending_amount_lkr=Sum("amount_lkr", filter=Q(status=Payment.Status.PENDING)),
             verified_amount_lkr=Sum("amount_lkr", filter=Q(status=Payment.Status.VERIFIED)),
         )
-        totals["pending_amount_lkr"] = totals["pending_amount_lkr"] or Decimal("0.00")
         totals["verified_amount_lkr"] = totals["verified_amount_lkr"] or Decimal("0.00")
+        sales = Sale.objects.filter(status=Sale.Status.CONFIRMED).select_related("reservation", "import_order")
+        settlement_rows = [sale_payment_summary(sale) for sale in sales]
+        totals["outstanding_receivables_lkr"] = sum((row["outstanding_balance_lkr"] for row in settlement_rows), Decimal("0.00"))
+        totals["outstanding_finance_settlement_lkr"] = sum((row["outstanding_balance_lkr"] for sale, row in zip(sales, settlement_rows) if sale.import_order_id), Decimal("0.00"))
+        totals["fully_settled_count"] = sum(row["outstanding_balance_lkr"] == 0 for row in settlement_rows)
+        totals["partially_settled_count"] = sum(row["verified_received_lkr"] > 0 and row["outstanding_balance_lkr"] > 0 for row in settlement_rows)
         return Response(totals)
 
 
@@ -1561,8 +1845,6 @@ class PaymentVerifyView(APIView):
                     details={"sale_reference": sale.reference if sale else None,
                              "reservation_reference": reservation.reference if reservation else None,
                              "import_reference": import_order.reference if import_order else None})
-                create_notifications([payment.recorded_by], f"payment:{payment.pk}:decision:verified",
-                    "Payment verified", f"Payment {payment.reference} was verified.", "/staff/payments")
         except Payment.DoesNotExist:
             return Response({"detail": "Payment not found."}, status=status.HTTP_404_NOT_FOUND)
         return Response(PaymentSerializer(payment).data)
@@ -1587,8 +1869,44 @@ class PaymentRejectView(APIView):
                 payment.save(update_fields=["status", "rejected_by", "rejected_at", "rejection_reason"])
                 AuditEvent.objects.create(actor=request.user, action="payment.rejected", subject=payment.reference,
                     details={"rejection_reason": payment.rejection_reason})
-                create_notifications([payment.recorded_by], f"payment:{payment.pk}:decision:rejected",
-                    "Payment rejected", f"Payment {payment.reference} was rejected.", "/staff/payments")
+        except Payment.DoesNotExist:
+            return Response({"detail": "Payment not found."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(PaymentSerializer(payment).data)
+
+
+class PaymentReverseView(APIView):
+    permission_classes = [PaymentAccess]
+    payment_action = "reverse"
+
+    def post(self, request, reference):
+        reason = str(request.data.get("reason", "")).strip()
+        if not reason:
+            return Response({"reason": "A reversal reason is required."}, status=status.HTTP_400_BAD_REQUEST)
+        if len(reason) > 1000:
+            return Response({"reason": "Reason must be 1000 characters or fewer."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            with transaction.atomic():
+                payment = Payment.objects.select_for_update().get(reference=reference)
+                if payment.status != Payment.Status.VERIFIED:
+                    return Response({"detail": "Only confirmed payments can be reversed."}, status=status.HTTP_409_CONFLICT)
+                if payment.sale_id:
+                    Sale.objects.select_for_update().get(pk=payment.sale_id)
+                elif payment.reservation_id:
+                    Reservation.objects.select_for_update().get(pk=payment.reservation_id)
+                else:
+                    ImportOrder.objects.select_for_update().get(pk=payment.import_order_id)
+                payment.status = Payment.Status.REVERSED
+                payment.reversed_by = request.user
+                payment.reversed_at = timezone.now()
+                payment.reversal_reason = reason
+                payment.save(update_fields=["status", "reversed_by", "reversed_at", "reversal_reason"])
+                AuditEvent.objects.create(actor=request.user, action="payment.reversed", subject=payment.reference,
+                    details={"reason": reason, "sale_reference": payment.sale.reference if payment.sale_id else None,
+                             "reservation_reference": payment.reservation.reference if payment.reservation_id else None,
+                             "import_reference": payment.import_order.reference if payment.import_order_id else None})
+                notify_active_roles((User.Role.CEO, User.Role.MANAGER), f"payment:{payment.pk}:reversed",
+                    "Payment reversed", f"Payment {payment.reference} was reversed.", "/staff/payments",
+                    exclude_user_ids=(request.user.pk,))
         except Payment.DoesNotExist:
             return Response({"detail": "Payment not found."}, status=status.HTTP_404_NOT_FOUND)
         return Response(PaymentSerializer(payment).data)
@@ -1596,9 +1914,10 @@ class PaymentRejectView(APIView):
 
 class SalePaymentSummaryView(APIView):
     permission_classes = [PaymentAccess]
+    payment_action = "settlement_summary"
 
     def get(self, request, reference):
-        sale = get_object_or_404(Sale.objects.select_related("reservation", "import_order"), reference=reference)
+        sale = get_object_or_404(Sale.objects.select_related("reservation", "import_order", "vehicle", "customer"), reference=reference)
         scope = Q(sale=sale)
         if sale.reservation_id:
             scope |= Q(reservation_id=sale.reservation_id)
@@ -1608,7 +1927,11 @@ class SalePaymentSummaryView(APIView):
             verified=Sum("amount_lkr", filter=Q(status=Payment.Status.VERIFIED)),
             pending=Sum("amount_lkr", filter=Q(status=Payment.Status.PENDING)))
         received = totals["verified"] or Decimal("0.00")
+        photo = sale.vehicle.photos.first()
         return Response({"sale_reference": sale.reference, "sale_price_lkr": sale.agreed_price_lkr,
+            "customer_name": sale.customer.full_name, "vehicle_name": f"{sale.vehicle.manufacture_year} {sale.vehicle.make} {sale.vehicle.model} {sale.vehicle.variant}".strip(),
+            "vehicle_reference": sale.vehicle.reference, "vehicle_image_url": f"/api/vehicle-photos/{photo.pk}/" if photo else None,
+            "transaction_date": sale.sale_date, "transaction_type": sale.get_sale_type_display(),
             "verified_received_lkr": received, "pending_verification_lkr": totals["pending"] or Decimal("0.00"),
             "outstanding_balance_lkr": max(Decimal("0.00"), sale.agreed_price_lkr - received)})
 
@@ -1625,7 +1948,13 @@ class ReservationPaymentSummaryView(APIView):
             pending=Sum("amount_lkr", filter=Q(status=Payment.Status.PENDING)))
         received = totals["verified"] or Decimal("0.00")
         agreed = sale.agreed_price_lkr if sale else reservation.agreed_price_lkr
+        photo = reservation.vehicle.photos.first()
         return Response({"reservation_reference": reservation.reference,
+            "customer_name": reservation.customer.full_name,
+            "vehicle_name": f"{reservation.vehicle.manufacture_year} {reservation.vehicle.make} {reservation.vehicle.model} {reservation.vehicle.variant}".strip(),
+            "vehicle_reference": reservation.vehicle.reference, "vehicle_image_url": f"/api/vehicle-photos/{photo.pk}/" if photo else None,
+            "transaction_date": reservation.created_at.date(), "transaction_type": "Reservation",
+            "agreed_price_lkr": agreed,
             "advance_declared_unverified_lkr": reservation.advance_amount_lkr,
             "verified_received_lkr": received, "pending_verification_lkr": totals["pending"] or Decimal("0.00"),
             "outstanding_balance_lkr": max(Decimal("0.00"), agreed - received),
@@ -1790,10 +2119,14 @@ class QuotationPDFView(APIView):
 
 class ImportPaymentSummaryView(APIView):
     permission_classes = [PaymentAccess]
+    payment_action = "settlement_summary"
 
     def get(self, request, reference):
         order = get_object_or_404(ImportOrder, reference=reference)
-        totals = Payment.objects.filter(import_order=order).aggregate(
+        sale = order.sales.select_related("vehicle", "customer").first()
+        photo = sale.vehicle.photos.first() if sale and sale.vehicle_id else None
+        payment_scope = Q(import_order=order) | Q(sale=sale) if sale else Q(import_order=order)
+        totals = Payment.objects.filter(payment_scope).aggregate(
             verified=Sum("amount_lkr", filter=Q(status=Payment.Status.VERIFIED)),
             pending=Sum("amount_lkr", filter=Q(status=Payment.Status.PENDING)),
             rejected=Sum("amount_lkr", filter=Q(status=Payment.Status.REJECTED)),
@@ -1802,9 +2135,16 @@ class ImportPaymentSummaryView(APIView):
             rejected_count=Count("id", filter=Q(status=Payment.Status.REJECTED)),
         )
         return Response({"import_reference": order.reference,
+            "customer_name": order.customer.full_name,
+            "vehicle_name": (f"{sale.vehicle.manufacture_year} {sale.vehicle.make} {sale.vehicle.model} {sale.vehicle.variant}".strip() if sale and sale.vehicle_id else order.vehicle_description),
+            "vehicle_reference": sale.vehicle.reference if sale and sale.vehicle_id else (order.vehicle.reference if order.vehicle_id else None),
+            "vehicle_image_url": f"/api/vehicle-photos/{photo.pk}/" if photo else None,
+            "transaction_date": order.created_at.date(), "transaction_type": "Personal Import",
+            "sale_price_lkr": sale.agreed_price_lkr if sale else None,
             "verified_amount_lkr": totals["verified"] or Decimal("0.00"),
             "pending_amount_lkr": totals["pending"] or Decimal("0.00"),
             "rejected_amount_lkr": totals["rejected"] or Decimal("0.00"),
+            "outstanding_balance_lkr": max(Decimal("0.00"), sale.agreed_price_lkr - (totals["verified"] or Decimal("0.00"))) if sale else None,
             "verified_count": totals["verified_count"], "pending_count": totals["pending_count"],
             "rejected_count": totals["rejected_count"]})
 

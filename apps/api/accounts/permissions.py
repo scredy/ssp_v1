@@ -97,26 +97,26 @@ class SalesAccess(BasePermission):
 
 
 class PaymentAccess(BasePermission):
-    """Staff/MD record; CEO/MD review; staff/CEO/MD can read authorized payments."""
+    """Only CEO and MD/Manager can manage financial transactions."""
 
     def has_permission(self, request, view):
         if not request.user or not request.user.is_authenticated:
             return False
         role = request.user.role
         action = getattr(view, "payment_action", "")
+        if action == "settlement_summary":
+            return request.method in {"GET", "HEAD", "OPTIONS"} and role in {"staff", "ceo", "manager"}
         if action == "record":
-            return request.method == "POST" and role in {"staff", "manager"}
-        if action == "collection":
-            if request.method == "GET":
-                return role in {"staff", "ceo", "manager"}
-            return request.method == "POST" and role in {"staff", "manager"}
-        if action in {"verify", "reject"}:
             return request.method == "POST" and role in {"ceo", "manager"}
-        return request.method in {"GET", "HEAD", "OPTIONS"} and role in {"staff", "ceo", "manager"}
+        if action == "collection":
+            return role in {"ceo", "manager"} and request.method in {"GET", "POST"}
+        if action in {"verify", "reject", "reverse"}:
+            return request.method == "POST" and role in {"ceo", "manager"}
+        return request.method in {"GET", "HEAD", "OPTIONS"} and role in {"ceo", "manager"}
 
 
 class HandoverAccess(BasePermission):
-    """Staff and MD prepare/submit; MD or CEO finalizes; CEO otherwise reviews read-only."""
+    """Staff prepare; MD and CEO perform their assigned approval stages; MD finalizes."""
 
     def has_permission(self, request, view):
         if not request.user or not request.user.is_authenticated:
@@ -124,7 +124,7 @@ class HandoverAccess(BasePermission):
         role = request.user.role
         action = getattr(view, "handover_action", "")
         if action == "eligible_sales":
-            return request.method in {"GET", "HEAD", "OPTIONS"} and role in {"staff", "manager"}
+            return request.method in {"GET", "HEAD", "OPTIONS"} and role == "staff"
         if action == "document_receipt":
             if request.method in {"GET", "HEAD", "OPTIONS"}:
                 return role in {"staff", "manager", "ceo"}
@@ -133,14 +133,20 @@ class HandoverAccess(BasePermission):
             if request.method in {"GET", "HEAD", "OPTIONS"}:
                 return role in {"staff", "manager", "ceo"}
             if action == "collection":
-                return request.method == "POST" and role in {"staff", "manager"}
+                return request.method == "POST" and role == "staff"
             if action == "detail":
-                return request.method == "PATCH" and role in {"staff", "manager"}
+                return request.method == "PATCH" and role == "staff"
             return False
         if action == "submit":
-            return request.method == "POST" and role in {"staff", "manager"}
-        if action == "finalize":
+            return request.method == "POST" and role == "staff"
+        if action == "approve_md":
+            return request.method == "POST" and role == "manager"
+        if action == "approve_ceo":
+            return request.method == "POST" and role == "ceo"
+        if action == "return":
             return request.method == "POST" and role in {"manager", "ceo"}
+        if action == "finalize":
+            return request.method == "POST" and role == "manager"
         return False
 
 

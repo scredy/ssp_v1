@@ -1,6 +1,8 @@
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from threading import Barrier
+from unittest import skipUnless
+from uuid import uuid4
 
 from django.conf import settings
 from django.db import close_old_connections, connections
@@ -40,20 +42,22 @@ class PaymentApiTests(APITestCase):
 
     def sale_payload(self, **overrides):
         return {"sale_reference": self.sale.reference, "amount_lkr": "250.00", "method": "bank_transfer",
-                "transaction_reference": "BANK-PAYMENT-001", "payment_date": "2026-11-21", **overrides}
+                "transaction_reference": "BANK-PAYMENT-001", "funds_cleared": True, "payment_date": "2026-11-21", **overrides}
 
     def record_payment(self, user=None, payload=None):
-        self.client.force_authenticate(user or self.staff)
-        return self.client.post("/api/staff/payments/", payload or self.sale_payload(), format="json")
+        self.client.force_authenticate(user or self.manager)
+        data = dict(payload or self.sale_payload())
+        data.setdefault("idempotency_key", uuid4().hex)
+        return self.client.post("/api/staff/payments/", data, format="json")
 
     def make_import(self, user=None, customer=None):
-        self.client.force_authenticate(user or self.staff)
+        self.client.force_authenticate(user or self.manager)
         return self.client.post("/api/staff/imports/", {"customer_id": (customer or self.customer).pk,
             "vehicle_description": "Toyota import order", "country_of_origin": "Japan"}, format="json")
 
     def import_payment(self, reference, transaction_reference="IMPORT-PAYMENT-001", user=None):
-        return self.record_payment(user or self.staff, {"import_reference": reference, "amount_lkr": "125.50",
-            "method": "bank_transfer", "transaction_reference": transaction_reference, "payment_date": "2026-11-21"})
+        return self.record_payment(user or self.manager, {"import_reference": reference, "amount_lkr": "125.50",
+            "method": "bank_transfer", "transaction_reference": transaction_reference, "funds_cleared": True, "payment_date": "2026-11-21"})
 
     def test_import_payment_without_vehicle_verification_summary_and_milestone(self):
         created = self.make_import()
@@ -63,21 +67,17 @@ class PaymentApiTests(APITestCase):
         response = self.import_payment(order.reference)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(response.data["import_reference"], order.reference)
-        self.assertEqual(response.data["status"], Payment.Status.PENDING)
-        self.client.force_authenticate(self.ceo)
-        verified = self.client.post(f"/api/staff/payments/{response.data['reference']}/verify/", {}, format="json")
-        self.assertEqual(verified.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["status"], Payment.Status.VERIFIED)
         self.client.force_authenticate(self.staff)
         summary = self.client.get(f"/api/staff/imports/{order.reference}/payments/summary/")
         self.assertEqual(Decimal(summary.data["verified_amount_lkr"]), Decimal("125.50"))
-        self.assertEqual(summary.data["pending_count"], 0)
         self.assertNotIn("outstanding_balance_lkr", summary.data)
         milestone = self.client.post(f"/api/staff/imports/{order.reference}/milestones/", {
             "kind": "payment_verified", "payment_reference": response.data["reference"],
             "customer_description": "A payment for this import has been verified."}, format="json")
         self.assertEqual(milestone.status_code, status.HTTP_201_CREATED)
 
-    def test_import_payment_permissions_customer_consistency_rejection_and_no_double_count(self):
+    def test_import_payment_permissions_customer_consistency_and_no_double_count(self):
         created = self.make_import()
         order = ImportOrder.objects.get(reference=created.data["reference"])
         self.client.force_authenticate(self.ceo)
@@ -97,76 +97,76 @@ class PaymentApiTests(APITestCase):
         self.client.force_authenticate(self.ceo)
         rejected = self.client.post(f"/api/staff/payments/{payment.data['reference']}/reject/",
             {"rejection_reason": "Transfer receipt could not be matched."}, format="json")
-        self.assertEqual(rejected.status_code, status.HTTP_200_OK)
-        self.assertEqual(rejected.data["status"], Payment.Status.REJECTED)
-        self.assertEqual(self.client.post(f"/api/staff/payments/{payment.data['reference']}/verify/", {}, format="json").status_code, status.HTTP_409_CONFLICT)
-        duplicate = self.import_payment(order.reference, "IMPORT-PAYMENT-REJECT", self.staff)
+        self.assertEqual(rejected.status_code, status.HTTP_409_CONFLICT)
+        duplicate = self.import_payment(order.reference, "IMPORT-PAYMENT-REJECT", self.manager)
         self.assertEqual(duplicate.status_code, status.HTTP_409_CONFLICT)
-        good = self.import_payment(order.reference, "IMPORT-PAYMENT-VERIFIED", self.staff)
-        self.client.force_authenticate(self.ceo)
-        self.assertEqual(self.client.post(f"/api/staff/payments/{good.data['reference']}/verify/", {}, format="json").status_code, status.HTTP_200_OK)
+        self.client.force_authenticate(self.manager)
+        reversed_payment = self.client.post(f"/api/staff/payments/{payment.data['reference']}/reverse/",
+            {"reason": "Duplicate import payment record."}, format="json")
+        self.assertEqual(reversed_payment.status_code, status.HTTP_200_OK)
+        self.assertEqual(reversed_payment.data["status"], Payment.Status.REVERSED)
+        good = self.import_payment(order.reference, "IMPORT-PAYMENT-VERIFIED", self.manager)
+        self.assertEqual(good.data["status"], Payment.Status.VERIFIED)
         order.vehicle = self.vehicle
         order.save(update_fields=["vehicle"])
         sale = Sale.objects.create(vehicle=self.vehicle, customer=self.customer, agreed_price_lkr=Decimal("1000.00"), created_by=self.manager)
         import_summary = self.client.get(f"/api/staff/imports/{order.reference}/payments/summary/")
         sale_summary = self.client.get(f"/api/manager/sales/{sale.reference}/payments/summary/")
         self.assertEqual(Decimal(import_summary.data["verified_amount_lkr"]), Decimal("125.50"))
-        self.assertEqual(Decimal(sale_summary.data["verified_received_lkr"]), Decimal("0.00"))
+        self.assertEqual(Decimal(sale_summary.data["verified_received_lkr"]), Decimal("125.50"))
         self.assertEqual(Payment.objects.filter(import_order=order).count(), 2)
 
-    def test_payment_creation_is_pending_and_only_verified_amount_reduces_balance(self):
+    def test_payment_creation_is_confirmed_immediately_and_reduces_balance(self):
         response = self.record_payment()
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(response.data["status"], Payment.Status.PENDING)
+        self.assertEqual(response.data["status"], Payment.Status.VERIFIED)
         self.assertFalse(response.data["evidence_attached"])
         summary = self.client.get(f"/api/manager/sales/{self.sale.reference}/payments/summary/")
-        self.assertEqual(Decimal(summary.data["verified_received_lkr"]), Decimal("0.00"))
-        self.assertEqual(Decimal(summary.data["outstanding_balance_lkr"]), Decimal("1000.00"))
-        self.client.force_authenticate(self.ceo)
-        verified = self.client.post(f"/api/staff/payments/{response.data['reference']}/verify/", {}, format="json")
-        self.assertEqual(verified.status_code, status.HTTP_200_OK)
-        self.assertEqual(verified.data["status"], Payment.Status.VERIFIED)
-        self.assertEqual(verified.data["verified_by_name"], self.ceo.username)
+        self.assertEqual(Decimal(summary.data["verified_received_lkr"]), Decimal("250.00"))
+        self.assertEqual(Decimal(summary.data["outstanding_balance_lkr"]), Decimal("750.00"))
+        self.assertEqual(response.data["verified_by_name"], self.manager.username)
         summary = self.client.get(f"/api/manager/sales/{self.sale.reference}/payments/summary/")
         self.assertEqual(Decimal(summary.data["verified_received_lkr"]), Decimal("250.00"))
         self.assertEqual(Decimal(summary.data["outstanding_balance_lkr"]), Decimal("750.00"))
         self.assertTrue(AuditEvent.objects.filter(action="payment.recorded", subject=response.data["reference"]).exists())
-        self.assertTrue(AuditEvent.objects.filter(action="payment.verified", subject=response.data["reference"]).exists())
         self.assertEqual(self.client.post(f"/api/staff/payments/{response.data['reference']}/verify/", {}, format="json").status_code, status.HTTP_409_CONFLICT)
 
-    def test_dashboard_summary_uses_real_pending_and_verified_records(self):
+    def test_dashboard_summary_reports_immediately_confirmed_records(self):
         pending = self.record_payment(payload=self.sale_payload(transaction_reference="BANK-SUMMARY-009"))
         verified_pending = self.record_payment(payload=self.sale_payload(amount_lkr="50.00", transaction_reference="BANK-SUMMARY-010"))
         self.client.force_authenticate(self.ceo)
-        self.assertEqual(self.client.post(f"/api/staff/payments/{verified_pending.data['reference']}/verify/", {}, format="json").status_code, status.HTTP_200_OK)
         summary = self.client.get("/api/staff/payments/summary/")
         self.assertEqual(summary.status_code, status.HTTP_200_OK)
-        self.assertEqual(summary.data["pending_count"], 1)
-        self.assertEqual(summary.data["verified_count"], 1)
-        self.assertEqual(Decimal(summary.data["pending_amount_lkr"]), Decimal("250.00"))
-        self.assertEqual(Decimal(summary.data["verified_amount_lkr"]), Decimal("50.00"))
+        self.assertEqual(summary.data["verified_count"], 2)
+        self.assertEqual(Decimal(summary.data["verified_amount_lkr"]), Decimal("300.00"))
 
-    def test_self_verification_is_denied_and_payment_can_be_rejected_with_reason(self):
-        own = self.record_payment(self.manager, self.sale_payload(transaction_reference="BANK-OWN-002"))
-        self.assertEqual(own.status_code, status.HTTP_201_CREATED)
-        self.client.force_authenticate(self.manager)
-        self.assertEqual(self.client.post(f"/api/staff/payments/{own.data['reference']}/verify/", {}, format="json").status_code, status.HTTP_403_FORBIDDEN)
-        missing_reason = self.client.post(f"/api/staff/payments/{own.data['reference']}/reject/", {"rejection_reason": "  "}, format="json")
+    def test_legacy_pending_payment_can_be_resolved_by_management(self):
+        pending = Payment.objects.create(sale=self.sale, amount_lkr=Decimal("10.00"), method=Payment.Method.CASH,
+            recorded_by=self.manager, status=Payment.Status.PENDING)
+        self.client.force_authenticate(self.ceo)
+        verified = self.client.post(f"/api/staff/payments/{pending.reference}/verify/", {}, format="json")
+        self.assertEqual(verified.status_code, status.HTTP_200_OK)
+        self.assertEqual(verified.data["status"], Payment.Status.VERIFIED)
+        legacy = Payment.objects.create(sale=self.sale, amount_lkr=Decimal("10.00"), method=Payment.Method.CASH,
+            recorded_by=self.manager, status=Payment.Status.PENDING)
+        missing_reason = self.client.post(f"/api/staff/payments/{legacy.reference}/reject/", {"rejection_reason": "  "}, format="json")
         self.assertEqual(missing_reason.status_code, status.HTTP_400_BAD_REQUEST)
-        rejected = self.client.post(f"/api/staff/payments/{own.data['reference']}/reject/", {"rejection_reason": "Reference does not match the bank advice."}, format="json")
+        rejected = self.client.post(f"/api/staff/payments/{legacy.reference}/reject/", {"rejection_reason": "Reference does not match the bank advice."}, format="json")
         self.assertEqual(rejected.status_code, status.HTTP_200_OK)
         self.assertEqual(rejected.data["status"], Payment.Status.REJECTED)
-        self.assertEqual(rejected.data["rejection_reason"], "Reference does not match the bank advice.")
-        self.assertTrue(AuditEvent.objects.filter(action="payment.rejected", subject=own.data["reference"]).exists())
+        self.assertTrue(AuditEvent.objects.filter(action="payment.rejected", subject=legacy.reference).exists())
 
-    def test_role_permissions_restrict_recording_and_review(self):
+    def test_role_permissions_restrict_financial_transaction_management(self):
         payload = self.sale_payload(transaction_reference="BANK-ROLE-003")
-        self.assertEqual(self.record_payment(self.ceo, payload).status_code, status.HTTP_403_FORBIDDEN)
+        ceo_payment = self.record_payment(self.ceo, payload)
+        self.assertEqual(ceo_payment.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(ceo_payment.data["status"], Payment.Status.VERIFIED)
         self.client.force_authenticate(self.staff)
-        self.assertEqual(self.client.get("/api/staff/payments/").status_code, status.HTTP_200_OK)
-        self.assertEqual(self.client.post("/api/staff/payments/", self.sale_payload(transaction_reference="BANK-ROLE-004"), format="json").status_code, status.HTTP_201_CREATED)
-        payment = Payment.objects.get(transaction_reference="BANK-ROLE-004")
+        self.assertEqual(self.client.get("/api/staff/payments/").status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(self.client.post("/api/staff/payments/", self.sale_payload(transaction_reference="BANK-ROLE-004"), format="json").status_code, status.HTTP_403_FORBIDDEN)
+        payment = Payment.objects.get(transaction_reference="BANK-ROLE-003")
         self.assertEqual(self.client.post(f"/api/staff/payments/{payment.reference}/verify/", {}, format="json").status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(self.client.get(f"/api/staff/payments/{payment.reference}/").status_code, status.HTTP_403_FORBIDDEN)
         for denied in (self.admin, self.rep, None):
             self.client.force_authenticate(denied)
             self.assertEqual(self.client.get("/api/staff/payments/").status_code, status.HTTP_403_FORBIDDEN)
@@ -179,20 +179,28 @@ class PaymentApiTests(APITestCase):
         self.assertEqual(second.status_code, status.HTTP_409_CONFLICT)
         self.assertEqual(Payment.objects.filter(transaction_reference="BANK-DUPLICATE-005").count(), 1)
 
+    def test_cleared_funds_and_idempotency_are_required_for_non_cash_duplicate_safety(self):
+        uncleared = self.record_payment(payload=self.sale_payload(transaction_reference="BANK-UNCLEARED-005", funds_cleared=False))
+        self.assertEqual(uncleared.status_code, status.HTTP_400_BAD_REQUEST)
+        payload = self.sale_payload(transaction_reference="BANK-IDEMPOTENT-005", idempotency_key="payment-form-attempt-0005")
+        first = self.record_payment(payload=payload)
+        duplicate = self.record_payment(payload=payload)
+        self.assertEqual(first.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(duplicate.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(Payment.objects.filter(idempotency_key="payment-form-attempt-0005").count(), 1)
+
     def test_reservation_payments_carry_forward_once_without_verifying_declared_advance(self):
         vehicle = self.make_vehicle("2")
         vehicle.status = Vehicle.Status.RESERVED
         vehicle.save(update_fields=["status"])
         reservation = Reservation.objects.create(customer=self.customer, vehicle=vehicle, responsible_staff=self.staff,
             agreed_price_lkr=Decimal("900.00"), advance_amount_lkr=Decimal("500.00"))
-        actual = self.record_payment(self.staff, {"reservation_reference": reservation.reference, "amount_lkr": "250.00",
+        actual = self.record_payment(self.manager, {"reservation_reference": reservation.reference, "amount_lkr": "250.00",
             "method": "cash", "payment_date": "2026-11-21"})
         self.assertEqual(actual.status_code, status.HTTP_201_CREATED)
         before = self.client.get(f"/api/staff/reservations/{reservation.reference}/payments/summary/")
         self.assertEqual(Decimal(before.data["advance_declared_unverified_lkr"]), Decimal("500.00"))
-        self.assertEqual(Decimal(before.data["verified_received_lkr"]), Decimal("0.00"))
-        self.client.force_authenticate(self.ceo)
-        self.assertEqual(self.client.post(f"/api/staff/payments/{actual.data['reference']}/verify/", {}, format="json").status_code, status.HTTP_200_OK)
+        self.assertEqual(Decimal(before.data["verified_received_lkr"]), Decimal("250.00"))
 
         self.client.force_authenticate(self.manager)
         sale_response = self.client.post("/api/manager/sales/", {"customer_id": self.customer.pk,
@@ -213,14 +221,15 @@ class PaymentApiTests(APITestCase):
     def test_verified_overpayment_is_rejected_and_verified_records_are_immutable(self):
         first = self.record_payment(payload=self.sale_payload(amount_lkr="700.00", transaction_reference="BANK-OVER-006"))
         second = self.record_payment(payload=self.sale_payload(amount_lkr="400.00", transaction_reference="BANK-OVER-007"))
+        self.assertEqual(first.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(second.status_code, status.HTTP_409_CONFLICT)
         self.client.force_authenticate(self.ceo)
-        self.assertEqual(self.client.post(f"/api/staff/payments/{first.data['reference']}/verify/", {}, format="json").status_code, status.HTTP_200_OK)
-        self.assertEqual(self.client.post(f"/api/staff/payments/{second.data['reference']}/verify/", {}, format="json").status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(self.client.post(f"/api/staff/payments/{first.data['reference']}/verify/", {}, format="json").status_code, status.HTTP_409_CONFLICT)
         self.assertEqual(self.client.patch(f"/api/staff/payments/{first.data['reference']}/", {"amount_lkr": "1.00"}, format="json").status_code, status.HTTP_403_FORBIDDEN)
         self.assertEqual(self.client.delete(f"/api/staff/payments/{first.data['reference']}/").status_code, status.HTTP_403_FORBIDDEN)
 
     def test_payment_evidence_is_stored_privately_and_authorized_download_is_required(self):
-        self.client.force_authenticate(self.staff)
+        self.client.force_authenticate(self.manager)
         proof = SimpleUploadedFile("proof.pdf", b"%PDF-1.4\nprivate evidence\n%%EOF", content_type="application/pdf")
         response = self.client.post("/api/staff/payments/", {**self.sale_payload(transaction_reference="BANK-EVIDENCE-008"), "evidence": proof}, format="multipart")
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
@@ -240,6 +249,7 @@ class PaymentApiTests(APITestCase):
 class ConcurrentPaymentVerificationTests(TransactionTestCase):
     reset_sequences = True
 
+    @skipUnless(connections["default"].features.has_select_for_update, "Requires database row-lock support")
     def test_only_one_concurrent_verification_can_exceed_the_remaining_balance(self):
         recorder = User.objects.create_user(username="concurrent-recorder", password="Payment-Test-345!", role=User.Role.STAFF)
         reviewer = User.objects.create_user(username="concurrent-reviewer", password="Payment-Test-345!", role=User.Role.CEO)

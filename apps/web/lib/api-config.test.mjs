@@ -24,14 +24,17 @@ test("local API and web URLs use one cookie host even when loopback aliases diff
   assert.equal(resolveApiBaseUrl("https://api.example.test", "https://www.example.test"), "https://api.example.test");
 });
 
-test("staff login and dashboard share the configured API client", async () => {
-  const [login, dashboard] = await Promise.all([
+test("staff login and role dashboard share the configured API client", async () => {
+  const [login, dashboardRoute, dashboard] = await Promise.all([
     readFile(new URL("../app/staff/login/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/staff/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../components/role-dashboard.tsx", import.meta.url), "utf8"),
   ]);
   assert.match(login, /import \{ api \} from "@\/lib\/car-api"/);
-  assert.match(dashboard, /import \{ API \} from "@\/lib\/car-api"/);
+  assert.match(dashboardRoute, /RoleDashboard from "@\/components\/role-dashboard"/);
+  assert.match(dashboard, /import \{ api, User \} from "@\/lib\/car-api"/);
   assert.doesNotMatch(login, /NEXT_PUBLIC_API_BASE_URL/);
+  assert.doesNotMatch(dashboardRoute, /NEXT_PUBLIC_API_BASE_URL/);
   assert.doesNotMatch(dashboard, /NEXT_PUBLIC_API_BASE_URL/);
 });
 

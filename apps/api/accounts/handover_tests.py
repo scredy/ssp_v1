@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from threading import Barrier
+from unittest import skipUnless
 
 from django.conf import settings
 from django.db import close_old_connections, connections
@@ -10,7 +11,7 @@ from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 from django.core.files.uploadedfile import SimpleUploadedFile
 
-from .models import AuditEvent, CommissionLedgerEntry, Customer, Handover, HandoverDocumentReceipt, Payment, Reservation, Sale, User, Vehicle
+from .models import AuditEvent, CommissionLedgerEntry, Customer, Handover, HandoverApproval, HandoverDocumentReceipt, Notification, Payment, Reservation, Sale, User, Vehicle
 
 
 class HandoverApiTests(APITestCase):
@@ -60,6 +61,20 @@ class HandoverApiTests(APITestCase):
         self.assertEqual(submitted.status_code, status.HTTP_200_OK)
         return submitted.data
 
+    def md_approved_handover(self, sale=None):
+        handover = self.ready_handover(sale)
+        self.client.force_authenticate(self.manager)
+        response = self.client.post(f"/api/staff/handovers/{handover['reference']}/approve-md/", {}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        return response.data
+
+    def ceo_approved_handover(self, sale=None):
+        handover = self.md_approved_handover(sale)
+        self.client.force_authenticate(self.ceo)
+        response = self.client.post(f"/api/staff/handovers/{handover['reference']}/approve-ceo/", {}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        return response.data
+
     def test_verified_reservation_down_payment_release_document_receipt_and_later_finance_settlement(self):
         vehicle = self.make_vehicle("FINANCE")
         vehicle.status = Vehicle.Status.RESERVED
@@ -90,9 +105,18 @@ class HandoverApiTests(APITestCase):
         self.client.force_authenticate(self.manager)
         blocked = self.client.post(f"{detail}finalize/", {}, format="json")
         self.assertEqual(blocked.status_code, status.HTTP_409_CONFLICT)
-        self.assertIn("down payment", blocked.data["detail"].lower())
+        self.assertIn("CEO-approved", blocked.data["detail"])
+        self.assertEqual(self.client.post(f"{detail}approve-md/", {}, format="json").status_code, status.HTTP_200_OK)
+        self.client.force_authenticate(self.ceo)
+        blocked = self.client.post(f"{detail}approve-ceo/", {}, format="json")
+        self.assertEqual(blocked.status_code, status.HTTP_409_CONFLICT)
+        self.assertIn("down payment", blocked.data["payment"].lower())
+        self.client.force_authenticate(self.manager)
         self.assertEqual(self.client.post(f"/api/staff/payments/{advance_remainder.reference}/verify/", {}, format="json").status_code,
                          status.HTTP_200_OK)
+        self.client.force_authenticate(self.ceo)
+        self.assertEqual(self.client.post(f"{detail}approve-ceo/", {}, format="json").status_code, status.HTTP_200_OK)
+        self.client.force_authenticate(self.manager)
         finalized = self.client.post(f"{detail}finalize/", {}, format="json")
         self.assertEqual(finalized.status_code, status.HTTP_200_OK)
         self.assertEqual(Decimal(finalized.data["financial_summary"]["verified_received_lkr"]), Decimal("200000.00"))
@@ -118,7 +142,13 @@ class HandoverApiTests(APITestCase):
         self.assertEqual(pdf["Content-Type"], "application/pdf")
         self.assertEqual(pdf["Cache-Control"], "private, no-store")
         pdf_bytes = pdf.content
-        self.assertIn(b"VEHICLE & DOCUMENT HANDOVER ACKNOWLEDGMENT", pdf_bytes)
+        self.assertIn(b"VEHICLE & DOCUMENT", pdf_bytes)
+        self.assertIn(b"HANDOVER ACKNOWLEDGMENT", pdf_bytes)
+        self.assertIn(b"/Logo 5 0 R", pdf_bytes)
+        self.assertIn(b"COMPANY AND VEHICLE ITEMS HANDED OVER", pdf_bytes)
+        self.assertIn(b"CUSTOMER ACKNOWLEDGMENT", pdf_bytes)
+        self.assertIn(b"CUSTOMER NAME", pdf_bytes)
+        self.assertIn(b"ISSUED BY", pdf_bytes)
         self.assertIn(b"not a payment receipt", pdf_bytes)
         self.assertEqual(self.client.get(detail).data["financial_summary"]["outstanding_balance_lkr"], Decimal("700000.00"))
 
@@ -128,16 +158,14 @@ class HandoverApiTests(APITestCase):
         self.assertEqual(self.client.get(f"/api/staff/handovers/{handover['reference']}/document-receipt/{issued.data['reference']}/pdf/").status_code,
                          status.HTTP_403_FORBIDDEN)
 
-        self.client.force_authenticate(self.staff)
+        self.client.force_authenticate(self.manager)
         finance = self.client.post("/api/staff/payments/", {"sale_reference": sale.reference,
             "amount_lkr": "700000.00", "method": "bank_transfer", "transaction_reference": "FINANCE-COMPANY-SETTLEMENT-A",
+            "funds_cleared": True, "idempotency_key": "finance-company-settlement-handover-test",
             "payment_date": "2026-11-21"}, format="json")
         self.assertEqual(finance.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(finance.data["status"], Payment.Status.PENDING)
-        self.assertEqual(self.client.get(detail).data["financial_summary"]["outstanding_balance_lkr"], Decimal("700000.00"))
-        self.client.force_authenticate(self.manager)
-        self.assertEqual(self.client.post(f"/api/staff/payments/{finance.data['reference']}/verify/", {}, format="json").status_code,
-                         status.HTTP_200_OK)
+        self.assertEqual(finance.data["status"], Payment.Status.VERIFIED)
+        self.assertEqual(self.client.get(detail).data["financial_summary"]["outstanding_balance_lkr"], Decimal("0.00"))
         self.assertEqual(self.client.post(f"/api/staff/payments/{finance.data['reference']}/verify/", {}, format="json").status_code,
                          status.HTTP_409_CONFLICT)
         final_summary = self.client.get(detail).data["financial_summary"]
@@ -168,7 +196,7 @@ class HandoverApiTests(APITestCase):
         self.assertEqual(self.client.patch(detail, self.checklist_payload(), format="json").status_code, status.HTTP_200_OK)
         submitted = self.client.post(f"{detail}submit/", {}, format="json")
         self.assertEqual(submitted.status_code, status.HTTP_200_OK)
-        self.assertEqual(submitted.data["status"], Handover.Status.READY_FOR_REVIEW)
+        self.assertEqual(submitted.data["status"], Handover.Status.PENDING_MD_REVIEW)
 
         Payment.objects.create(sale=self.sale, amount_lkr=Decimal("200000"), method=Payment.Method.CASH, recorded_by=self.staff,
             status=Payment.Status.VERIFIED, verified_by=self.manager)
@@ -176,6 +204,12 @@ class HandoverApiTests(APITestCase):
         self.assertEqual(self.client.get(detail).data["financial_summary"]["balance_review_required"], True)
         self.assertEqual(self.client.get(detail).data["commission_eligible"], False)
 
+        self.client.force_authenticate(self.manager)
+        finalized = self.client.post(f"{detail}finalize/", {}, format="json")
+        self.assertEqual(finalized.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(self.client.post(f"{detail}approve-md/", {}, format="json").status_code, status.HTTP_200_OK)
+        self.client.force_authenticate(self.ceo)
+        self.assertEqual(self.client.post(f"{detail}approve-ceo/", {}, format="json").status_code, status.HTTP_200_OK)
         self.client.force_authenticate(self.manager)
         finalized = self.client.post(f"{detail}finalize/", {}, format="json")
         self.assertEqual(finalized.status_code, status.HTTP_200_OK)
@@ -193,12 +227,15 @@ class HandoverApiTests(APITestCase):
         self.assertTrue(AuditEvent.objects.filter(action="handover.submitted_for_review", subject=reference).exists())
         self.assertTrue(AuditEvent.objects.filter(action="handover.finalized", subject=reference).exists())
 
-    def test_ceo_can_finalize_a_reviewed_handover(self):
-        handover = self.ready_handover()
+    def test_ceo_cannot_finalize_and_manager_finalizes_after_ceo_approval(self):
+        handover = self.ceo_approved_handover()
         self.client.force_authenticate(self.ceo)
         response = self.client.post(f"/api/staff/handovers/{handover['reference']}/finalize/", {}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.client.force_authenticate(self.manager)
+        response = self.client.post(f"/api/staff/handovers/{handover['reference']}/finalize/", {}, format="json")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data["finalized_by_name"], self.ceo.username)
+        self.assertEqual(response.data["finalized_by_name"], self.manager.username)
         self.vehicle.refresh_from_db()
         self.assertEqual(self.vehicle.status, Vehicle.Status.HANDED_OVER)
 
@@ -212,6 +249,10 @@ class HandoverApiTests(APITestCase):
         self.assertEqual(self.client.post("/api/staff/handovers/", {"sale_reference": self.sale.reference}, format="json").status_code, status.HTTP_403_FORBIDDEN)
 
         self.client.force_authenticate(self.manager)
+        preparation = SimpleUploadedFile("receipt.pdf", b"%PDF-1.4\nprivate handover evidence\n%%EOF", content_type="application/pdf")
+        denied = self.client.post("/api/staff/handovers/", {"sale_reference": self.sale.reference, "supporting_evidence": preparation}, format="multipart")
+        self.assertEqual(denied.status_code, status.HTTP_403_FORBIDDEN)
+        self.client.force_authenticate(self.staff)
         preparation = SimpleUploadedFile("receipt.pdf", b"%PDF-1.4\nprivate handover evidence\n%%EOF", content_type="application/pdf")
         response = self.client.post("/api/staff/handovers/", {"sale_reference": self.sale.reference, "supporting_evidence": preparation}, format="multipart")
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
@@ -227,9 +268,16 @@ class HandoverApiTests(APITestCase):
         self.assertEqual(self.client.get(response.data["evidence_url"]).status_code, status.HTTP_403_FORBIDDEN)
         handover.supporting_evidence.storage.delete(handover.supporting_evidence.name)
 
-    def test_staff_can_update_ready_preparation_and_it_returns_for_review(self):
+    def test_md_return_preserves_decision_history_then_staff_can_edit_and_resubmit(self):
         ready = self.ready_handover()
         url = f"/api/staff/handovers/{ready['reference']}/"
+        self.client.force_authenticate(self.staff)
+        self.assertEqual(self.client.patch(url, {"internal_notes": "Must not retain approval."}, format="json").status_code, status.HTTP_409_CONFLICT)
+        self.client.force_authenticate(self.manager)
+        returned = self.client.post(f"/api/staff/handovers/{ready['reference']}/return/", {"comments": "Please attach the final condition checklist."}, format="json")
+        self.assertEqual(returned.status_code, status.HTTP_200_OK)
+        self.assertEqual(returned.data["status"], Handover.Status.PREPARING)
+        self.assertEqual(returned.data["approval_history"][-1]["comments"], "Please attach the final condition checklist.")
         self.client.force_authenticate(self.staff)
         updated = self.client.patch(url, {"internal_notes": "Recheck odometer reading."}, format="json")
         self.assertEqual(updated.status_code, status.HTTP_200_OK)
@@ -249,13 +297,9 @@ class HandoverApiTests(APITestCase):
         self.client.force_authenticate(self.ceo)
         self.assertEqual(self.client.get("/api/staff/handovers/eligible-sales/").status_code, status.HTTP_403_FORBIDDEN)
 
-    def test_manager_can_prepare_submit_and_update_handover(self):
+    def test_manager_cannot_prepare_or_submit_handover(self):
         prepared = self.create_handover(user=self.manager)
-        self.assertEqual(prepared.status_code, status.HTTP_201_CREATED)
-        detail = f"/api/staff/handovers/{prepared.data['reference']}/"
-        self.client.force_authenticate(self.manager)
-        self.assertEqual(self.client.patch(detail, self.checklist_payload(), format="json").status_code, status.HTTP_200_OK)
-        self.assertEqual(self.client.post(f"{detail}submit/", {}, format="json").status_code, status.HTTP_200_OK)
+        self.assertEqual(prepared.status_code, status.HTTP_403_FORBIDDEN)
 
     def test_commission_policy_ceo_only_and_pending_entry_created_at_finalized_handover(self):
         brackets = [{"minimum_lkr": "0.00", "maximum_lkr": "1000000.00", "percentage": "2.5",
@@ -280,7 +324,7 @@ class HandoverApiTests(APITestCase):
         overlap = brackets + [{"minimum_lkr": "999999.00", "maximum_lkr": None, "percentage": "3.0",
                                "effective_date": "2026-01-01", "active": True}]
         self.assertEqual(self.client.put("/api/commission-rules/brackets/", overlap, format="json").status_code, status.HTTP_400_BAD_REQUEST)
-        handover = self.ready_handover()
+        handover = self.ceo_approved_handover()
         self.assertEqual(CommissionLedgerEntry.objects.count(), 0)
         self.client.force_authenticate(self.manager)
         result = self.client.post(f"/api/staff/handovers/{handover['reference']}/finalize/", {}, format="json")
@@ -300,10 +344,102 @@ class HandoverApiTests(APITestCase):
         self.client.force_authenticate(self.rep)
         self.assertEqual(self.client.get("/api/commissions/").status_code, status.HTTP_403_FORBIDDEN)
 
+    def test_mandatory_chain_history_notification_routing_and_repeat_protection(self):
+        handover = self.ready_handover()
+        reference = handover["reference"]
+        detail = f"/api/staff/handovers/{reference}/"
+        self.assertEqual(handover["status"], Handover.Status.PENDING_MD_REVIEW)
+        self.assertEqual(Notification.objects.filter(recipient=self.manager).count(), 1)
+        self.assertEqual(Notification.objects.filter(recipient=self.ceo).count(), 0)
+
+        self.client.force_authenticate(self.staff)
+        self.assertEqual(self.client.post(f"{detail}approve-md/", {}, format="json").status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(self.client.post(f"{detail}approve-ceo/", {}, format="json").status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(self.client.post(f"{detail}finalize/", {}, format="json").status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(self.client.post(f"{detail}submit/", {}, format="json").status_code, status.HTTP_409_CONFLICT)
+
+        self.client.force_authenticate(self.manager)
+        self.assertEqual(self.client.post(f"{detail}approve-ceo/", {}, format="json").status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(self.client.post(f"{detail}finalize/", {}, format="json").status_code, status.HTTP_409_CONFLICT)
+        md = self.client.post(f"{detail}approve-md/", {}, format="json")
+        self.assertEqual(md.status_code, status.HTTP_200_OK)
+        self.assertEqual(md.data["status"], Handover.Status.PENDING_CEO_APPROVAL)
+        self.assertEqual(self.client.post(f"{detail}approve-md/", {}, format="json").status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(Notification.objects.filter(recipient=self.ceo).count(), 1)
+
+        self.client.force_authenticate(self.ceo)
+        self.assertEqual(self.client.post(f"{detail}return/", {}, format="json").status_code, status.HTTP_400_BAD_REQUEST)
+        returned = self.client.post(f"{detail}return/", {"comments": "Correct the delivery date evidence."}, format="json")
+        self.assertEqual(returned.status_code, status.HTTP_200_OK)
+        self.assertEqual(returned.data["status"], Handover.Status.PENDING_MD_REVIEW)
+        self.assertIsNone(returned.data["md_approved_by_name"])
+        self.assertEqual(returned.data["approval_history"][-1]["status_before"], Handover.Status.PENDING_CEO_APPROVAL)
+        self.assertEqual(returned.data["approval_history"][-1]["comments"], "Correct the delivery date evidence.")
+        self.assertEqual(Notification.objects.filter(recipient=self.manager).count(), 2)
+        self.assertEqual(self.client.post(f"{detail}approve-ceo/", {}, format="json").status_code, status.HTTP_409_CONFLICT)
+
+        self.client.force_authenticate(self.manager)
+        second_md = self.client.post(f"{detail}approve-md/", {}, format="json")
+        self.assertEqual(second_md.status_code, status.HTTP_200_OK)
+        self.client.force_authenticate(self.ceo)
+        approved = self.client.post(f"{detail}approve-ceo/", {}, format="json")
+        self.assertEqual(approved.status_code, status.HTTP_200_OK)
+        self.assertFalse(approved.data["commission_eligible"])
+        self.assertEqual(CommissionLedgerEntry.objects.filter(sale=self.sale).count(), 0)
+        self.assertEqual(Notification.objects.filter(recipient=self.manager).count(), 3)
+
+        self.client.force_authenticate(self.staff)
+        self.assertEqual(self.client.patch(detail, {"delivery_date": "2026-11-22"}, format="json").status_code, status.HTTP_409_CONFLICT)
+        self.client.force_authenticate(self.manager)
+        self.assertEqual(self.client.post(f"{detail}finalize/", {}, format="json").status_code, status.HTTP_200_OK)
+        duplicate_finalize = self.client.post(f"{detail}finalize/", {}, format="json")
+        self.assertEqual(duplicate_finalize.status_code, status.HTTP_409_CONFLICT)
+        result = self.client.get(detail).data
+        self.assertEqual([entry["decision"] for entry in result["approval_history"]], [
+            HandoverApproval.Decision.SUBMITTED_FOR_MD,
+            HandoverApproval.Decision.MD_APPROVED,
+            HandoverApproval.Decision.CEO_RETURNED,
+            HandoverApproval.Decision.MD_APPROVED,
+            HandoverApproval.Decision.CEO_APPROVED,
+            HandoverApproval.Decision.FINALIZED,
+        ])
+        self.assertEqual(CommissionLedgerEntry.objects.filter(sale=self.sale).count(), 1)
+
+    def test_md_can_return_ceo_approved_handover_before_material_edits_and_history_survives(self):
+        approved = self.ceo_approved_handover()
+        detail = f"/api/staff/handovers/{approved['reference']}/"
+        self.client.force_authenticate(self.manager)
+        returned = self.client.post(f"{detail}return/", {"comments": "Customer acknowledgement must be refreshed."}, format="json")
+        self.assertEqual(returned.status_code, status.HTTP_200_OK)
+        self.assertEqual(returned.data["status"], Handover.Status.PREPARING)
+        self.assertIsNone(returned.data["md_approved_by_name"])
+        self.assertIsNone(returned.data["ceo_approved_by_name"])
+        self.client.force_authenticate(self.staff)
+        edited = self.client.patch(detail, {"customer_acknowledgement": "Updated acknowledgement."}, format="json")
+        self.assertEqual(edited.status_code, status.HTTP_200_OK)
+        self.assertEqual(edited.data["status"], Handover.Status.PREPARING)
+        self.assertEqual(edited.data["approval_history"][-1]["decision"], HandoverApproval.Decision.MD_RETURNED)
+
+    def test_non_approval_roles_are_denied_and_approval_history_is_append_only(self):
+        pending = self.ready_handover()
+        detail = f"/api/staff/handovers/{pending['reference']}/"
+        for user in (self.admin, self.rep):
+            self.client.force_authenticate(user)
+            for action in ("submit/", "approve-md/", "approve-ceo/", "return/", "finalize/"):
+                self.assertEqual(self.client.post(f"{detail}{action}", {"comments": "reason"}, format="json").status_code, status.HTTP_403_FORBIDDEN)
+        self.client.force_authenticate(self.manager)
+        self.assertEqual(self.client.patch(detail, self.checklist_payload(), format="json").status_code, status.HTTP_403_FORBIDDEN)
+        approval = HandoverApproval.objects.get(handover__reference=pending["reference"])
+        with self.assertRaises(Exception):
+            HandoverApproval.objects.filter(pk=approval.pk).update(comments="rewrite")
+        with self.assertRaises(Exception):
+            approval.delete()
+
 
 class ConcurrentHandoverFinalizationTests(TransactionTestCase):
     reset_sequences = True
 
+    @skipUnless(connections["default"].features.has_select_for_update, "Concurrent row-lock verification requires a database with SELECT FOR UPDATE.")
     def test_only_one_concurrent_finalization_succeeds(self):
         staff = User.objects.create_user(username="parallel-handover-staff", password="Handover-Test-345!", role=User.Role.STAFF)
         manager = User.objects.create_user(username="parallel-handover-manager", password="Handover-Test-345!", role=User.Role.MANAGER)
@@ -317,9 +453,11 @@ class ConcurrentHandoverFinalizationTests(TransactionTestCase):
             confirmed_at="2026-11-21T09:00:00Z", created_by=manager)
         checklist_a = {key: True for key in ("bodywork", "interior", "tyres", "lights", "odometer")}
         checklist_b = {key: True for key in ("keys", "registration_documents", "insurance_documents", "service_documents")}
+        ceo = User.objects.create_user(username="parallel-handover-ceo", password="Handover-Test-345!", role=User.Role.CEO)
         handover = Handover.objects.create(sale=sale, customer=customer, vehicle=vehicle, prepared_by=staff,
-            status=Handover.Status.READY_FOR_REVIEW, delivery_date="2026-11-21", vehicle_condition_checklist=checklist_a,
-            keys_documents_checklist=checklist_b, customer_acknowledgement="Acknowledged.", customer_acknowledged_at=timezone.now())
+            status=Handover.Status.CEO_APPROVED, delivery_date="2026-11-21", vehicle_condition_checklist=checklist_a,
+            keys_documents_checklist=checklist_b, customer_acknowledgement="Acknowledged.", customer_acknowledged_at=timezone.now(),
+            md_approved_by=manager, md_approved_at=timezone.now(), ceo_approved_by=ceo, ceo_approved_at=timezone.now())
         barrier = Barrier(2)
 
         def finalize():

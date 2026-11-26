@@ -41,7 +41,7 @@ export default function StaffLogin() {
       <h1>Sign in</h1>
       <p className="description">Use the account provided by your administrator.</p>
       {notice && <p className="account-reset-success" role="status">{notice}</p>}
-      <form className="login-form" onSubmit={submit}>
+      <form className="login-form" method="post" onSubmit={submit}>
         <label>Username<input name="username" autoComplete="username" required /></label>
         <label>Password<input name="password" type="password" autoComplete="current-password" required /></label>
         {error && <p className="form-error" role="alert">{error}</p>}

@@ -38,3 +38,23 @@ uploads/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Local Playwright output and acceptance evidence (keep source specs/configs).
+/test-results/
+/playwright-report/
+/apps/web/test-results/
+/apps/web/playwright-report/
+/test-harness/artifacts/
+/test-harness/report.md
+/test-harness/runs/
+/test-harness/runs/*/artifacts/
+/test-harness/runs/*/browsers/
+/test-harness/runs/*/npm-cache/
+/test-harness/runs/*/__pycache__/
+/test-harness/runs/*/REPORT.md
+/test-harness/runs/*/RESULTS.html
+
+# Local uploaded/private business evidence; never version customer documents.
+/apps/api/media/
+/apps/api/private_handover_evidence/
+/apps/api/private_payment_evidence/

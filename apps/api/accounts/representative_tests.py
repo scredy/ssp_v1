@@ -99,6 +99,14 @@ class RepresentativeApiTests(APITestCase):
         self.make_ledger_entry(other_sale, other_customer, other_vehicle, other_rep, manager)
 
         self.client.force_authenticate(rep)
+        empty_rep = self.user("rep-without-commissions", User.Role.REP)
+        self.client.force_authenticate(empty_rep)
+        empty_commissions = self.client.get("/api/rep/commissions/")
+        self.assertEqual(empty_commissions.status_code, status.HTTP_200_OK)
+        self.assertEqual(empty_commissions.data, [])
+        self.assertEqual(self.client.get("/api/rep/commissions/?view=leaderboard").data, [])
+
+        self.client.force_authenticate(rep)
         dashboard = self.client.get("/api/rep/dashboard/")
         self.assertEqual(dashboard.status_code, status.HTTP_200_OK)
         self.assertEqual(dashboard.data["confirmed_sales"], 1)
@@ -113,6 +121,8 @@ class RepresentativeApiTests(APITestCase):
         commissions = self.client.get("/api/rep/commissions/")
         self.assertEqual(commissions.status_code, status.HTTP_200_OK)
         self.assertEqual([row["sale_reference"] for row in commissions.data], [sale.reference])
+        self.assertEqual([row["sale_reference"] for row in self.client.get("/api/rep/commissions/?search=OWN").data], [sale.reference])
+        self.assertEqual(self.client.get("/api/rep/commissions/?search=OTHER").data, [])
         self.assertNotIn("policy_snapshot", commissions.data[0])
         self.assertEqual(self.client.post("/api/rep/commissions/", {}, format="json").status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
 
@@ -157,6 +167,11 @@ class RepresentativeApiTests(APITestCase):
         self.assertEqual(paid.data["paid_by"], manager.username)
         self.assertEqual(self.client.post(f"/api/commissions/{other_entry.pk}/transition/", payout_payload, format="json").status_code, status.HTTP_200_OK)
         self.assertEqual(AuditEvent.objects.filter(action="commission.paid", subject=other_sale.reference).count(), 1)
+        self.client.force_authenticate(other_rep)
+        rep_paid_rows = self.client.get("/api/rep/commissions/?view=leaderboard")
+        self.assertEqual(rep_paid_rows.status_code, status.HTTP_200_OK)
+        self.assertEqual(rep_paid_rows.data, [{"rep_name": other_rep.first_name, "paid_entries": 1,
+                                              "paid_total_lkr": Decimal("22500.00")}])
 
         self.client.force_authenticate(ceo)
         self.assertEqual(self.client.post(f"/api/commissions/{own_entry.pk}/transition/", payout_payload, format="json").status_code, status.HTTP_409_CONFLICT)
