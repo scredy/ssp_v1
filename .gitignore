@@ -56,5 +56,6 @@ Desktop.ini
 
 # Local uploaded/private business evidence; never version customer documents.
 /apps/api/media/
+/apps/api/staticfiles/
 /apps/api/private_handover_evidence/
 /apps/api/private_payment_evidence/

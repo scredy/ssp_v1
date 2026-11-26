@@ -4,3 +4,5 @@ django-cors-headers>=4.7,<5.0
 python-dotenv>=1.0,<2.0
 psycopg[binary]>=3.2,<4.0
 Pillow>=11.0,<13.0
+gunicorn>=23.0,<24.0
+whitenoise>=6.9,<7.0

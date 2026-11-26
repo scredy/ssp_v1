@@ -7,7 +7,6 @@ from django.utils import timezone
 from uuid import uuid4
 import secrets
 from decimal import Decimal
-from pathlib import Path
 from django.conf import settings
 from django.core.files.storage import FileSystemStorage
 from django.utils.deconstruct import deconstructible
@@ -32,7 +31,7 @@ def vehicle_photo_path(instance, filename):
 class PrivatePaymentEvidenceStorage(FileSystemStorage):
     """Payment evidence is stored outside the public MEDIA_ROOT tree."""
     def __init__(self):
-        super().__init__(location=Path(settings.BASE_DIR) / "private_payment_evidence", base_url=None)
+        super().__init__(location=settings.PRIVATE_PAYMENT_EVIDENCE_ROOT, base_url=None)
 
 
 def payment_evidence_path(instance, filename):
@@ -44,7 +43,7 @@ def payment_evidence_path(instance, filename):
 class PrivateHandoverEvidenceStorage(FileSystemStorage):
     """Handover evidence is stored outside the public media tree."""
     def __init__(self):
-        super().__init__(location=Path(settings.BASE_DIR) / "private_handover_evidence", base_url=None)
+        super().__init__(location=settings.PRIVATE_HANDOVER_EVIDENCE_ROOT, base_url=None)
 
 
 def handover_evidence_path(instance, filename):

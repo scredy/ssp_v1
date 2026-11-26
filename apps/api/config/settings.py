@@ -115,6 +115,10 @@ COMPANY_PHONE = os.environ.get("COMPANY_PHONE", os.environ.get("NEXT_PUBLIC_COMP
 COMPANY_EMAIL = os.environ.get("COMPANY_EMAIL", os.environ.get("NEXT_PUBLIC_COMPANY_EMAIL", "")).strip()
 ACCOUNT_PORTAL_URL = os.environ.get("ACCOUNT_PORTAL_URL", "http://localhost:3000").rstrip("/")
 SECURE_SSL_REDIRECT = not DEBUG
+# Render terminates TLS at its proxy and forwards the original scheme. Trust
+# that header so Django recognizes HTTPS and avoids redirect loops.
+if not DEBUG:
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 SECURE_CONTENT_TYPE_NOSNIFF = True
 X_FRAME_OPTIONS = "DENY"
 
@@ -133,6 +137,21 @@ TIME_ZONE = "Asia/Colombo"
 USE_I18N = True
 USE_TZ = True
 STATIC_URL = "static/"
-MEDIA_ROOT = BASE_DIR / "media"
+STATIC_ROOT = BASE_DIR / "staticfiles"
+MEDIA_ROOT = Path(os.environ.get("MEDIA_ROOT", BASE_DIR / "media"))
+PRIVATE_PAYMENT_EVIDENCE_ROOT = Path(os.environ.get(
+    "PRIVATE_PAYMENT_EVIDENCE_ROOT", BASE_DIR / "private_payment_evidence"
+))
+PRIVATE_HANDOVER_EVIDENCE_ROOT = Path(os.environ.get(
+    "PRIVATE_HANDOVER_EVIDENCE_ROOT", BASE_DIR / "private_handover_evidence"
+))
+if not DEBUG:
+    MIDDLEWARE.insert(1, "whitenoise.middleware.WhiteNoiseMiddleware")
+    STORAGES = {
+        "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+        "staticfiles": {
+            "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
+        },
+    }
 DATA_UPLOAD_MAX_NUMBER_FILES = 10
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"

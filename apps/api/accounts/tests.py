@@ -1,5 +1,7 @@
 from decimal import Decimal
 from django.conf import settings
+from django.db import DatabaseError
+from unittest.mock import patch
 
 from django.urls import reverse
 from rest_framework import status
@@ -16,6 +18,18 @@ class AccountApiTests(APITestCase):
     def login_as(self, user, password="Valid-password-914!"):
         self.client.force_authenticate(user=None)
         self.assertTrue(self.client.login(username=user.username, password=password))
+
+    def test_healthz_checks_database_and_returns_no_sensitive_details(self):
+        response = self.client.get("/healthz")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json(), {"status": "ok"})
+
+    @patch("config.urls.connection.cursor", side_effect=DatabaseError("private database detail"))
+    def test_healthz_returns_generic_unavailable_when_database_is_down(self, _cursor):
+        response = self.client.get("/healthz/")
+        self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        self.assertEqual(response.json(), {"status": "unavailable"})
+        self.assertNotIn("private database detail", response.content.decode())
 
     def test_login_me_and_logout_use_session_authentication(self):
         user = self.make_user("admin", User.Role.ADMIN)
