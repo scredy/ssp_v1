@@ -17,6 +17,7 @@ Set these in the Render service environment. Use the **internal** connection val
 | --- | --- |
 | `DJANGO_DEBUG` | `0` |
 | `DJANGO_SECRET_KEY` | A newly generated, private Django secret |
+| `DJANGO_ALLOWED_HOSTS` | Custom API hostnames, comma separated, without schemes |
 | `POSTGRES_DB` | Render database name |
 | `POSTGRES_USER` | Render database user |
 | `POSTGRES_PASSWORD` | Render database password |
@@ -27,6 +28,8 @@ Set these in the Render service environment. Use the **internal** connection val
 | `ACCOUNT_PORTAL_URL` | Public web app URL used in account emails |
 
 The app retains the `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_HOST`, and `POSTGRES_PORT` interface. Render supplies `PORT` to the start command. Configure working SMTP values for `EMAIL_HOST`, `EMAIL_PORT`, `EMAIL_HOST_USER`, `EMAIL_HOST_PASSWORD`, `EMAIL_USE_TLS`, and `DEFAULT_FROM_EMAIL`; production defaults to Django's SMTP backend. `EMAIL_BACKEND` can be set when intentionally using another backend. Company details can be supplied through `COMPANY_LOCATION`, `COMPANY_PHONE`, and `COMPANY_EMAIL`. Financing defaults can be overridden with `NEXT_PUBLIC_FINANCE_36M_PER_100K`, `NEXT_PUBLIC_FINANCE_60M_PER_100K`, `NEXT_PUBLIC_FINANCE_72M_PER_100K`, and `NEXT_PUBLIC_FINANCE_OD_PER_100K`.
+
+Render's `RENDER_EXTERNAL_HOSTNAME` is appended automatically to `DJANGO_ALLOWED_HOSTS` when present. Keep custom API domains in `DJANGO_ALLOWED_HOSTS`; the Render hostname addition does not replace them. Rejected hostnames are written by the `django.security.DisallowedHost` logger to service logs without logging request query strings or credentials.
 
 ## HTTPS and cookies
 

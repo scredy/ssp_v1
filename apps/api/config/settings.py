@@ -23,7 +23,35 @@ DEBUG = os.environ.get("DJANGO_DEBUG", "1").lower() in {"1", "true", "yes", "on"
 SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "dev-only-change-me")
 if not DEBUG and SECRET_KEY == "dev-only-change-me":
     raise RuntimeError("DJANGO_SECRET_KEY must be configured when DEBUG is disabled")
-ALLOWED_HOSTS = [host.strip() for host in os.environ.get("DJANGO_ALLOWED_HOSTS", "127.0.0.1,localhost").split(",") if host.strip()]
+
+
+def _get_allowed_hosts(environ=None):
+    environ = os.environ if environ is None else environ
+    hosts = [
+        host.strip()
+        for host in environ.get("DJANGO_ALLOWED_HOSTS", "127.0.0.1,localhost").split(",")
+        if host.strip()
+    ]
+    render_hostname = environ.get("RENDER_EXTERNAL_HOSTNAME", "").strip()
+    if render_hostname and render_hostname not in hosts:
+        hosts.append(render_hostname)
+    return hosts
+
+
+ALLOWED_HOSTS = _get_allowed_hosts()
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "handlers": {"console": {"class": "logging.StreamHandler"}},
+    "loggers": {
+        "django.security.DisallowedHost": {
+            "handlers": ["console"],
+            "level": "WARNING",
+            "propagate": False,
+        },
+    },
+}
 
 INSTALLED_APPS = [
     "django.contrib.auth",
