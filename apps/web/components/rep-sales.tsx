@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "@/lib/car-api";
 
-type Sale = { reference: string; vehicle_reference: string; vehicle_name: string; customer_name: string; sale_type: string; agreed_price_lkr: string; sale_date: string; status: "draft" | "confirmed"; confirmed_at: string | null; handover_status: "preparing" | "ready_for_review" | "finalized" | null; handover_finalized_at: string | null };
+type Sale = { reference: string; vehicle_reference: string; vehicle_name: string; customer_name: string; sale_type: string; agreed_price_lkr: string; sale_date: string; status: "draft" | "confirmed"; confirmed_at: string | null; handover_status: "preparing" | "pending_md_review" | "pending_ceo_approval" | "ceo_approved" | "finalized" | null; handover_finalized_at: string | null };
 const money = (value: string | number) => new Intl.NumberFormat("en-LK", { style: "currency", currency: "LKR", maximumFractionDigits: 2 }).format(Number(value || 0));
 const date = (value: string | null) => value ? new Intl.DateTimeFormat("en-LK", { dateStyle: "medium", timeZone: "Asia/Colombo" }).format(new Date(value)) : "—";
 

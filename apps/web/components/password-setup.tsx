@@ -33,7 +33,7 @@ export default function PasswordSetup({ mode }: { mode: "invitation" | "password
     <p className="eyebrow">SSP · STAFF PORTAL</p>
     <h1>{invitation ? "Set up your account" : "Reset your password"}</h1>
     <p className="description">{invitation ? "Choose a password to activate your individual SSP account." : "Choose a new password for your SSP account."}</p>
-    {!ready ? <p className="state-card" role="status">Checking secure link…</p> : !token ? <p className="form-error" role="alert">This link is missing or invalid. Request a new email link.</p> : <form className="login-form" onSubmit={submit}>
+    {!ready ? <p className="state-card" role="status">Checking secure link…</p> : !token ? <p className="form-error" role="alert">This link is missing or invalid. Request a new email link.</p> : <form className="login-form" method="post" onSubmit={submit}>
       <label>New password<input name="password" type="password" required minLength={12} autoComplete="new-password" /></label>
       <label>Confirm password<input name="confirmation" type="password" required minLength={12} autoComplete="new-password" /></label>
       <p className="field-note">Use at least 12 characters. The server also checks its configured password rules.</p>

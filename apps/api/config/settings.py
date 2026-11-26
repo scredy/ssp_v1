@@ -98,6 +98,7 @@ SESSION_COOKIE_SAMESITE = "Lax"
 CSRF_COOKIE_HTTPONLY = False  # The same-origin web client reads this to send X-CSRFToken.
 CSRF_COOKIE_SECURE = not DEBUG
 CSRF_COOKIE_SAMESITE = "Lax"
+CSRF_COOKIE_DOMAIN = os.environ.get("CSRF_COOKIE_DOMAIN") or None
 CSRF_TRUSTED_ORIGINS = [origin.strip() for origin in os.environ.get(
     "CSRF_TRUSTED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
 ).split(",") if origin.strip()]
@@ -109,6 +110,9 @@ EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER", "")
 EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD", "")
 EMAIL_USE_TLS = os.environ.get("EMAIL_USE_TLS", "false").lower() in {"1", "true", "yes", "on"}
 DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "SSP Motor Trading <no-reply@localhost>")
+COMPANY_LOCATION = os.environ.get("COMPANY_LOCATION", "").strip()
+COMPANY_PHONE = os.environ.get("COMPANY_PHONE", os.environ.get("NEXT_PUBLIC_COMPANY_PHONE", "")).strip()
+COMPANY_EMAIL = os.environ.get("COMPANY_EMAIL", os.environ.get("NEXT_PUBLIC_COMPANY_EMAIL", "")).strip()
 ACCOUNT_PORTAL_URL = os.environ.get("ACCOUNT_PORTAL_URL", "http://localhost:3000").rstrip("/")
 SECURE_SSL_REDIRECT = not DEBUG
 SECURE_CONTENT_TYPE_NOSNIFF = True

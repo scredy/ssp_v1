@@ -147,6 +147,13 @@ class Enquiry(models.Model):
         COMPLETED = "completed", "Completed"
         CANCELLED = "cancelled", "Cancelled"
 
+    class ConfirmationEmailStatus(models.TextChoices):
+        NO_EMAIL = "no_email", "No email address"
+        QUEUED = "queued", "Queued"
+        SENDING = "sending", "Sending"
+        SENT = "sent", "Accepted by mail service"
+        FAILED = "failed", "Failed"
+
     reference = models.CharField(max_length=24, unique=True, editable=False)
     customer = models.ForeignKey(Customer, on_delete=models.PROTECT, related_name="enquiries")
     vehicle = models.ForeignKey("Vehicle", on_delete=models.SET_NULL, null=True, blank=True, related_name="enquiries")
@@ -156,6 +163,12 @@ class Enquiry(models.Model):
     preferred_contact = models.CharField(max_length=16, choices=Customer._meta.get_field("preferred_contact").choices)
     requested_at = models.DateTimeField(null=True, blank=True)
     scheduled_at = models.DateTimeField(null=True, blank=True)
+    confirmation_email_status = models.CharField(max_length=16, choices=ConfirmationEmailStatus.choices, blank=True, default="")
+    confirmation_email_schedule = models.DateTimeField(null=True, blank=True)
+    confirmation_email_is_update = models.BooleanField(default=False)
+    confirmation_email_recipient = models.EmailField(blank=True)
+    confirmation_email_sent_at = models.DateTimeField(null=True, blank=True)
+    confirmation_email_error = models.CharField(max_length=500, blank=True)
     message = models.TextField(blank=True)
     internal_notes = models.TextField(blank=True)
     idempotency_key = models.CharField(max_length=64, unique=True, null=True, blank=True)
@@ -368,7 +381,9 @@ class HandoverQuerySet(models.QuerySet):
 class Handover(models.Model):
     class Status(models.TextChoices):
         PREPARING = "preparing", "Preparing"
-        READY_FOR_REVIEW = "ready_for_review", "Ready for Review"
+        PENDING_MD_REVIEW = "pending_md_review", "Pending MD Review"
+        PENDING_CEO_APPROVAL = "pending_ceo_approval", "Pending CEO Approval"
+        CEO_APPROVED = "ceo_approved", "CEO Approved"
         FINALIZED = "finalized", "Finalized"
 
     reference = models.CharField(max_length=24, unique=True, editable=False)
@@ -387,6 +402,10 @@ class Handover(models.Model):
     prepared_by = models.ForeignKey(User, on_delete=models.PROTECT, related_name="prepared_handovers")
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     updated_at = models.DateTimeField(auto_now=True)
+    md_approved_by = models.ForeignKey(User, on_delete=models.PROTECT, null=True, blank=True, related_name="md_approved_handovers")
+    md_approved_at = models.DateTimeField(null=True, blank=True)
+    ceo_approved_by = models.ForeignKey(User, on_delete=models.PROTECT, null=True, blank=True, related_name="ceo_approved_handovers")
+    ceo_approved_at = models.DateTimeField(null=True, blank=True)
     finalized_by = models.ForeignKey(User, on_delete=models.PROTECT, null=True, blank=True, related_name="finalized_handovers")
     finalized_at = models.DateTimeField(null=True, blank=True)
 
@@ -415,7 +434,7 @@ class Handover(models.Model):
             if not self.delivery_date or not condition_complete or not documents_complete or not self.customer_acknowledgement.strip() or not self.customer_acknowledged_at:
                 raise ValidationError("A finalized handover requires a delivery date, complete checklists, and recorded customer acknowledgement.")
             if not self.finalized_by_id or not self.finalized_at:
-                raise ValidationError("Finalization must record the responsible manager or CEO and timestamp.")
+                raise ValidationError("Finalization must record the responsible manager and timestamp.")
         if self._state.adding:
             if self.customer_id != self.sale.customer_id or self.vehicle_id != self.sale.vehicle_id:
                 raise ValidationError("Handover customer and vehicle must match the linked sale.")
@@ -430,16 +449,71 @@ class Handover(models.Model):
                 self.status != self.Status.FINALIZED
             ):
                 raise ValidationError("Finalized handovers are immutable and cannot be reversed.")
+            material_fields = ("delivery_date", "vehicle_condition_checklist", "keys_documents_checklist",
+                               "customer_acknowledgement", "customer_acknowledged_at", "supporting_evidence",
+                               "evidence_content_type", "internal_notes")
+            if previous.status in {self.Status.PENDING_CEO_APPROVAL, self.Status.CEO_APPROVED} and any(
+                getattr(previous, field) != getattr(self, field) for field in material_fields
+            ):
+                raise ValidationError("Preparation data cannot change while an MD or CEO approval is active.")
             if previous.status != self.status:
-                allowed = ((previous.status == self.Status.PREPARING and self.status == self.Status.READY_FOR_REVIEW) or
-                           (previous.status == self.Status.READY_FOR_REVIEW and self.status == self.Status.PREPARING) or
-                           (previous.status == self.Status.READY_FOR_REVIEW and self.status == self.Status.FINALIZED and self.finalized_by_id and self.finalized_at))
+                allowed = ((previous.status == self.Status.PREPARING and self.status == self.Status.PENDING_MD_REVIEW) or
+                           (previous.status == self.Status.PENDING_MD_REVIEW and self.status in {self.Status.PREPARING, self.Status.PENDING_CEO_APPROVAL}) or
+                           (previous.status == self.Status.PENDING_CEO_APPROVAL and self.status in {self.Status.PENDING_MD_REVIEW, self.Status.CEO_APPROVED}) or
+                           (previous.status == self.Status.CEO_APPROVED and self.status == self.Status.PREPARING) or
+                           (previous.status == self.Status.CEO_APPROVED and self.status == self.Status.FINALIZED and
+                            self.md_approved_by_id and self.md_approved_at and self.ceo_approved_by_id and self.ceo_approved_at and
+                            self.finalized_by_id and self.finalized_at))
                 if not allowed:
                     raise ValidationError("This handover status transition is not allowed.")
         return super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
         raise ValidationError("Handover history must be preserved.")
+
+
+class HandoverApprovalQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        raise ValidationError("Handover approval history is append-only.")
+
+    def delete(self):
+        if self.exists():
+            raise ValidationError("Handover approval history is append-only.")
+        return 0, {"accounts.HandoverApproval": 0}
+
+
+class HandoverApproval(models.Model):
+    class Decision(models.TextChoices):
+        SUBMITTED_FOR_MD = "submitted_for_md", "Submitted for MD review"
+        MD_APPROVED = "md_approved", "Approved by MD"
+        CEO_APPROVED = "ceo_approved", "Approved by CEO"
+        MD_RETURNED = "md_returned", "Returned to Staff"
+        CEO_RETURNED = "ceo_returned", "Returned to MD"
+        FINALIZED = "finalized", "Finalized by MD"
+
+    handover = models.ForeignKey(Handover, on_delete=models.PROTECT, related_name="approval_history")
+    reviewer = models.ForeignKey(User, on_delete=models.PROTECT, related_name="handover_approval_decisions")
+    reviewer_role = models.CharField(max_length=16)
+    decision = models.CharField(max_length=32, choices=Decision.choices)
+    status_before = models.CharField(max_length=20)
+    status_after = models.CharField(max_length=20)
+    comments = models.TextField(blank=True)
+    created_at = models.DateTimeField(default=timezone.now, db_index=True)
+
+    objects = HandoverApprovalQuerySet.as_manager()
+
+    class Meta:
+        ordering = ["created_at", "pk"]
+
+    def save(self, *args, **kwargs):
+        if self.pk and type(self).objects.filter(pk=self.pk).exists():
+            raise ValidationError("Handover approval history is append-only.")
+        if self.reviewer_id and self.reviewer_role != self.reviewer.role:
+            raise ValidationError("Reviewer role must match the role at the time of the decision.")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Handover approval history is append-only.")
 
 
 class HandoverDocumentReceipt(models.Model):
@@ -571,14 +645,25 @@ class Payment(models.Model):
         PENDING = "pending", "Pending"
         VERIFIED = "verified", "Verified"
         REJECTED = "rejected", "Rejected"
+        REVERSED = "reversed", "Reversed"
+
+    class PaymentType(models.TextChoices):
+        UNSPECIFIED = "unspecified", "Unspecified (historical)"
+        ADVANCE = "advance", "Advance"
+        PARTIAL = "partial", "Partial Payment"
+        FINAL = "final", "Final Payment"
+        FINANCE_SETTLEMENT = "finance_settlement", "Finance Settlement"
 
     reference = models.CharField(max_length=24, unique=True, editable=False)
     sale = models.ForeignKey(Sale, on_delete=models.PROTECT, null=True, blank=True, related_name="payments")
     reservation = models.ForeignKey(Reservation, on_delete=models.PROTECT, null=True, blank=True, related_name="payments")
     import_order = models.ForeignKey("ImportOrder", on_delete=models.PROTECT, null=True, blank=True, related_name="payments")
     amount_lkr = models.DecimalField(max_digits=14, decimal_places=2, validators=[MinValueValidator(Decimal("0.01"))])
+    payment_type = models.CharField(max_length=24, choices=PaymentType.choices, default=PaymentType.PARTIAL)
+    funds_cleared = models.BooleanField(default=False)
     method = models.CharField(max_length=16, choices=Method.choices)
     transaction_reference = models.CharField(max_length=120, blank=True, default="")
+    idempotency_key = models.CharField(max_length=64, blank=True, default="")
     payment_date = models.DateField(default=timezone.localdate)
     evidence = models.FileField(storage=PrivatePaymentEvidenceStorage(), upload_to=payment_evidence_path, blank=True)
     evidence_content_type = models.CharField(max_length=32, blank=True, default="")
@@ -591,6 +676,9 @@ class Payment(models.Model):
     rejected_by = models.ForeignKey(User, on_delete=models.PROTECT, null=True, blank=True, related_name="rejected_payments")
     rejected_at = models.DateTimeField(null=True, blank=True)
     rejection_reason = models.TextField(blank=True)
+    reversed_by = models.ForeignKey(User, on_delete=models.PROTECT, null=True, blank=True, related_name="reversed_payments")
+    reversed_at = models.DateTimeField(null=True, blank=True)
+    reversal_reason = models.TextField(blank=True)
 
     class Meta:
         ordering = ["-created_at"]
@@ -602,6 +690,7 @@ class Payment(models.Model):
                 name="payment_exactly_one_parent"),
             models.CheckConstraint(condition=models.Q(amount_lkr__gt=0), name="payment_amount_positive"),
             models.UniqueConstraint(fields=["transaction_reference"], condition=~models.Q(transaction_reference=""), name="payment_transaction_reference_unique"),
+            models.UniqueConstraint(fields=["idempotency_key"], condition=~models.Q(idempotency_key=""), name="payment_idempotency_key_unique"),
         ]
 
     def save(self, *args, **kwargs):

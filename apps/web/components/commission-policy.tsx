@@ -2,16 +2,16 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "@/lib/car-api";
+import { useStaffSession } from "@/components/staff-shell";
 
 type Bracket = { minimum_lkr: string; maximum_lkr: string | null; percentage: string; effective_date: string; active: boolean };
 type Rule = { key: string; value: Bracket[]; updated_at: string };
 type PolicyChange = { actor: string | null; created_at: string; previous: Bracket[] | null; current: Bracket[] };
-type CurrentUser = { role: string };
-
 const blankBracket = (): Bracket => ({ minimum_lkr: "", maximum_lkr: null, percentage: "", effective_date: "", active: true });
 const amount = (value: string | null) => value === null || value === "" ? "No upper limit" : new Intl.NumberFormat("en-LK", { style: "currency", currency: "LKR", maximumFractionDigits: 2 }).format(Number(value));
-const dateLabel = (value: string) => new Intl.DateTimeFormat("en-LK", { dateStyle: "medium", timeZone: "Asia/Colombo" }).format(new Date(`${value}T00:00:00`));
-const timestamp = (value: string) => new Intl.DateTimeFormat("en-LK", { dateStyle: "medium", timeStyle: "short", timeZone: "Asia/Colombo" }).format(new Date(value));
+const validDate = (value: unknown): value is string => typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`)) && new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) === value;
+const dateLabel = (value: string) => validDate(value) ? new Intl.DateTimeFormat("en-LK", { dateStyle: "medium", timeZone: "Asia/Colombo" }).format(new Date(`${value}T00:00:00Z`)) : "Date unavailable";
+const timestamp = (value: unknown) => { if (typeof value !== "string" || !value.trim()) return "Date unavailable"; const date = new Date(value); return Number.isNaN(date.getTime()) ? "Date unavailable" : new Intl.DateTimeFormat("en-LK", { dateStyle: "medium", timeStyle: "short", timeZone: "Asia/Colombo" }).format(date); };
 
 function validate(rows: Bracket[]) {
   if (!rows.length) return "Add at least one bracket to the policy schedule.";
@@ -23,7 +23,7 @@ function validate(rows: Bracket[]) {
     const percentage = Number(row.percentage);
     if (!Number.isFinite(minimum) || minimum < 0 || (maximum !== null && (!Number.isFinite(maximum) || maximum <= minimum))) return `Bracket ${index + 1}: enter a non-negative minimum and a maximum greater than the minimum, or leave maximum blank for no upper limit.`;
     if (!Number.isFinite(percentage) || percentage <= 0 || percentage > 100) return `Bracket ${index + 1}: percentage must be above 0 and at most 100.`;
-    if (Number.isNaN(Date.parse(`${row.effective_date}T00:00:00`))) return `Bracket ${index + 1}: enter a valid effective date.`;
+    if (!validDate(row.effective_date)) return `Bracket ${index + 1}: enter a valid effective date.`;
   }
   const active = rows.filter((row) => row.active).map((row) => ({ ...row, low: Number(row.minimum_lkr), high: row.maximum_lkr ? Number(row.maximum_lkr) : Infinity }));
   for (let index = 0; index < active.length; index++) {
@@ -37,9 +37,10 @@ function validate(rows: Bracket[]) {
 }
 
 export default function CommissionPolicy() {
+  const session = useStaffSession();
   const [rows, setRows] = useState<Bracket[]>([]);
   const [changes, setChanges] = useState<PolicyChange[]>([]);
-  const [canManage, setCanManage] = useState(false);
+  const canManage = session?.role === "ceo";
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
@@ -49,15 +50,16 @@ export default function CommissionPolicy() {
     setLoading(true);
     setError("");
     try {
-      const [rules, history, user] = await Promise.all([
+      const [rules, history] = await Promise.all([
         api<Rule[]>("/api/commission-rules/"),
         api<PolicyChange[]>("/api/commission-rules/?history=1"),
-        api<CurrentUser>("/api/auth/me/"),
       ]);
-      const schedule = rules.find((rule) => rule.key === "brackets")?.value ?? [];
-      setRows(schedule.map((row) => ({ ...row, maximum_lkr: row.maximum_lkr ?? "" })));
+      const storedSchedule = rules.find((rule) => rule.key === "brackets")?.value;
+      const schedule = Array.isArray(storedSchedule) ? storedSchedule : [];
+      const invalidDate = schedule.some((row) => !validDate(row.effective_date));
+      setRows(schedule.map((row) => ({ ...row, effective_date: validDate(row.effective_date) ? row.effective_date : "", maximum_lkr: row.maximum_lkr ?? "" })));
       setChanges(history);
-      setCanManage(user.role === "ceo");
+      if (invalidDate) setError("Some saved commission brackets have a missing or invalid effective date. Those dates are shown as unavailable; correct them before saving.");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Commission policy could not be loaded.");
     } finally { setLoading(false); }
@@ -67,7 +69,7 @@ export default function CommissionPolicy() {
 
   const byDate = useMemo(() => {
     const groups = new Map<string, Bracket[]>();
-    for (const row of rows) if (row.active) groups.set(row.effective_date, [...(groups.get(row.effective_date) ?? []), row]);
+    for (const row of rows) if (row.active && validDate(row.effective_date)) groups.set(row.effective_date, [...(groups.get(row.effective_date) ?? []), row]);
     return [...groups.entries()].sort(([a], [b]) => b.localeCompare(a));
   }, [rows]);
   const todayParts = new Intl.DateTimeFormat("en-CA", { year: "numeric", month: "2-digit", day: "2-digit", timeZone: "Asia/Colombo" }).formatToParts(new Date());

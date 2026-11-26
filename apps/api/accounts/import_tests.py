@@ -85,7 +85,7 @@ class ImportApiTests(APITestCase):
         self.assertEqual(self.client.post(endpoint, {"kind": "finalized_handover", "customer_description": "Done."}, format="json").status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(self.client.post(endpoint, {"kind": "payment_verified", "customer_description": "Payment verified."}, format="json").status_code, status.HTTP_400_BAD_REQUEST)
 
-    def test_verified_payment_is_required_for_financial_milestone(self):
+    def test_immediately_confirmed_payment_can_be_linked_to_financial_milestone(self):
         order = self.create_import().data
         endpoint = f"/api/staff/imports/{order['reference']}/milestones/"
         self.client.force_authenticate(self.staff)
@@ -93,16 +93,15 @@ class ImportApiTests(APITestCase):
         self.assertEqual(self.client.post(endpoint, body, format="json").status_code, status.HTTP_400_BAD_REQUEST)
         booking = self.client.post(endpoint, {"kind": "booking_confirmed", "customer_description": "Booking confirmed."}, format="json")
         self.assertEqual(booking.status_code, status.HTTP_201_CREATED)
+        self.client.force_authenticate(self.manager)
         payment_response = self.client.post("/api/staff/payments/", {"import_reference": order["reference"],
-            "amount_lkr": "100", "method": "cash", "transaction_reference": "IMPORT-MILESTONE-TEST"}, format="json")
+            "amount_lkr": "100", "method": "cash", "transaction_reference": "IMPORT-MILESTONE-TEST",
+            "idempotency_key": "import-milestone-payment-test"}, format="json")
         self.assertEqual(payment_response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(payment_response.data["status"], Payment.Status.VERIFIED)
         payment = Payment.objects.get(reference=payment_response.data["reference"])
+        self.client.force_authenticate(self.staff)
         body["payment_reference"] = payment.reference
-        unverified = self.client.post(endpoint, body, format="json")
-        self.assertEqual(unverified.status_code, status.HTTP_409_CONFLICT)
-        payment.status = Payment.Status.VERIFIED
-        payment.verified_by = self.ceo
-        payment.save(update_fields=["status", "verified_by"])
         verified = self.client.post(endpoint, body, format="json")
         self.assertEqual(verified.status_code, status.HTTP_201_CREATED)
         self.assertNotIn("payment_reference", verified.data)

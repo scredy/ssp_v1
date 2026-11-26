@@ -5,7 +5,7 @@ from django.utils import timezone
 from decimal import Decimal
 
 from .models import (BLApprovalRequest, Customer, Enquiry, HANDOVER_CONDITION_CHECKLIST,
-    HANDOVER_KEYS_DOCUMENTS_CHECKLIST, Handover, HandoverDocumentReceipt, ImportMilestone, ImportOrder, Payment,
+    HANDOVER_KEYS_DOCUMENTS_CHECKLIST, Handover, HandoverApproval, HandoverDocumentReceipt, ImportMilestone, ImportOrder, Payment,
     Notification, Quotation, RepresentativeProfile, Reservation, Sale, User, Vehicle, VehiclePhoto)
 from PIL import Image, UnidentifiedImageError
 from .payment_summaries import sale_payment_summary
@@ -205,10 +205,13 @@ class StaffEnquirySerializer(serializers.ModelSerializer):
         model = Enquiry
         fields = ("id", "reference", "kind", "status", "customer_name", "customer_email", "customer_phone",
                   "preferred_contact", "vehicle_reference", "vehicle_label", "vehicle_description", "requested_at", "scheduled_at",
-                  "message", "internal_notes", "created_at", "updated_at")
+                  "message", "internal_notes", "confirmation_email_status", "confirmation_email_schedule",
+                  "confirmation_email_recipient", "confirmation_email_sent_at", "confirmation_email_error",
+                  "created_at", "updated_at")
         read_only_fields = ("id", "reference", "kind", "customer_name", "customer_email", "customer_phone",
                             "preferred_contact", "vehicle_reference", "vehicle_label", "vehicle_description", "requested_at", "message",
-                            "created_at", "updated_at")
+                            "confirmation_email_status", "confirmation_email_schedule", "confirmation_email_recipient",
+                            "confirmation_email_sent_at", "confirmation_email_error", "created_at", "updated_at")
 
     def get_vehicle_label(self, obj):
         return f"{obj.vehicle.manufacture_year} {obj.vehicle.make} {obj.vehicle.model}" if obj.vehicle else ""
@@ -429,7 +432,7 @@ class SaleSerializer(serializers.ModelSerializer):
     representative_id = serializers.IntegerField(read_only=True, allow_null=True)
     representative_name = serializers.SerializerMethodField()
     reservation_reference = serializers.CharField(source="reservation.reference", read_only=True, allow_null=True)
-    import_reference = serializers.CharField(source="import_order.reference", read_only=True, allow_null=True)
+    import_reference = serializers.SerializerMethodField()
     created_by_name = serializers.SerializerMethodField()
 
     class Meta:
@@ -441,6 +444,9 @@ class SaleSerializer(serializers.ModelSerializer):
 
     def get_vehicle_name(self, obj):
         return f"{obj.vehicle.manufacture_year} {obj.vehicle.make} {obj.vehicle.model}"
+
+    def get_import_reference(self, obj):
+        return obj.import_order.reference if obj.import_order_id else ""
 
     def get_representative_name(self, obj):
         if not obj.representative:
@@ -458,8 +464,14 @@ class PaymentCreateSerializer(serializers.Serializer):
     reservation_reference = serializers.CharField(max_length=24, required=False, allow_blank=True, allow_null=True)
     import_reference = serializers.CharField(max_length=24, required=False, allow_blank=True, allow_null=True)
     amount_lkr = serializers.DecimalField(max_digits=14, decimal_places=2, min_value=Decimal("0.01"))
+    payment_type = serializers.ChoiceField(choices=[
+        (value, label) for value, label in Payment.PaymentType.choices
+        if value != Payment.PaymentType.UNSPECIFIED
+    ], required=False, default=Payment.PaymentType.PARTIAL)
     method = serializers.ChoiceField(choices=Payment.Method.choices)
+    funds_cleared = serializers.BooleanField(required=False, default=False)
     transaction_reference = serializers.CharField(max_length=120, required=False, allow_blank=True, default="", trim_whitespace=True)
+    idempotency_key = serializers.CharField(max_length=64, trim_whitespace=True)
     payment_date = serializers.DateField(required=False, default=timezone.localdate)
     evidence = serializers.FileField(required=False, allow_empty_file=False)
     notes = serializers.CharField(max_length=3000, required=False, allow_blank=True)
@@ -501,6 +513,8 @@ class PaymentCreateSerializer(serializers.Serializer):
         return file
 
     def validate(self, attrs):
+        if attrs.get("method") != Payment.Method.CASH and not attrs.get("funds_cleared"):
+            raise serializers.ValidationError({"funds_cleared": "Confirm that non-cash funds have been received and cleared before recording."})
         sale_ref = attrs.get("sale_reference", "")
         reservation_ref = attrs.get("reservation_reference", "")
         import_ref = attrs.get("import_reference", "")
@@ -519,14 +533,16 @@ class PaymentSerializer(serializers.ModelSerializer):
     recorded_by_name = serializers.CharField(source="recorded_by.username", read_only=True)
     verified_by_name = serializers.CharField(source="verified_by.username", read_only=True, allow_null=True)
     rejected_by_name = serializers.CharField(source="rejected_by.username", read_only=True, allow_null=True)
+    reversed_by_name = serializers.CharField(source="reversed_by.username", read_only=True, allow_null=True)
     evidence_attached = serializers.SerializerMethodField()
     evidence_url = serializers.SerializerMethodField()
 
     class Meta:
         model = Payment
-        fields = ("reference", "sale_reference", "reservation_reference", "import_reference", "customer_name", "amount_lkr", "method",
+        fields = ("reference", "sale_reference", "reservation_reference", "import_reference", "customer_name", "amount_lkr", "payment_type", "funds_cleared", "method",
                   "transaction_reference", "payment_date", "notes", "recorded_by_name", "created_at", "status",
                   "verified_by_name", "verified_at", "rejected_by_name", "rejected_at", "rejection_reason",
+                  "reversed_by_name", "reversed_at", "reversal_reason",
                   "evidence_attached", "evidence_url")
         read_only_fields = fields
 
@@ -536,6 +552,13 @@ class PaymentSerializer(serializers.ModelSerializer):
         if obj.reservation_id:
             return obj.reservation.customer.full_name
         return obj.import_order.customer.full_name
+
+    def get_import_reference(self, obj):
+        if obj.import_order_id:
+            return obj.import_order.reference
+        if obj.sale_id and obj.sale.import_order_id:
+            return obj.sale.import_order.reference
+        return None
 
     def get_evidence_attached(self, obj):
         return bool(obj.evidence)
@@ -785,6 +808,22 @@ class HandoverPreparationSerializer(serializers.Serializer):
         return attrs
 
 
+class HandoverApprovalSerializer(serializers.ModelSerializer):
+    reviewer_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = HandoverApproval
+        fields = ("reviewer_name", "reviewer_role", "decision", "status_before", "status_after", "comments", "created_at")
+        read_only_fields = fields
+
+    def get_reviewer_name(self, obj):
+        return obj.reviewer.get_full_name().strip() or obj.reviewer.username
+
+
+class HandoverDecisionSerializer(serializers.Serializer):
+    comments = serializers.CharField(max_length=2000, required=True, allow_blank=False, trim_whitespace=True)
+
+
 class HandoverSerializer(serializers.ModelSerializer):
     sale_reference = serializers.CharField(source="sale.reference", read_only=True)
     customer_id = serializers.IntegerField(read_only=True)
@@ -793,6 +832,11 @@ class HandoverSerializer(serializers.ModelSerializer):
     vehicle_name = serializers.SerializerMethodField()
     prepared_by_name = serializers.CharField(source="prepared_by.username", read_only=True)
     finalized_by_name = serializers.CharField(source="finalized_by.username", read_only=True, allow_null=True)
+    md_approved_by_name = serializers.CharField(source="md_approved_by.username", read_only=True, allow_null=True)
+    md_approved_at = serializers.DateTimeField(read_only=True)
+    ceo_approved_by_name = serializers.CharField(source="ceo_approved_by.username", read_only=True, allow_null=True)
+    ceo_approved_at = serializers.DateTimeField(read_only=True)
+    approval_history = HandoverApprovalSerializer(many=True, read_only=True)
     evidence_attached = serializers.SerializerMethodField()
     evidence_url = serializers.SerializerMethodField()
     financial_summary = serializers.SerializerMethodField()
@@ -804,8 +848,8 @@ class HandoverSerializer(serializers.ModelSerializer):
         fields = ("id", "reference", "sale_reference", "customer_id", "customer_name", "vehicle_reference", "vehicle_name",
                   "status", "delivery_date", "vehicle_condition_checklist", "keys_documents_checklist", "customer_acknowledgement",
                   "customer_acknowledged_at", "evidence_attached", "evidence_url", "internal_notes", "prepared_by_name",
-                  "created_at", "updated_at", "finalized_by_name", "finalized_at", "financial_summary", "commission_eligible",
-                  "document_receipt")
+                  "created_at", "updated_at", "md_approved_by_name", "md_approved_at", "ceo_approved_by_name", "ceo_approved_at",
+                  "approval_history", "finalized_by_name", "finalized_at", "financial_summary", "commission_eligible", "document_receipt")
         read_only_fields = fields
 
     def get_vehicle_name(self, obj):

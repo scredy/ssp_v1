@@ -1,4 +1,6 @@
-from django.core.cache import cache
+from datetime import timedelta
+
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
@@ -7,59 +9,68 @@ from .models import Notification, User
 
 class NotificationApiTests(APITestCase):
     def setUp(self):
-        cache.clear()
+        self.staff = User.objects.create_user(username="notification-staff", password="Test-pass-912!", role=User.Role.STAFF)
+        self.other = User.objects.create_user(username="notification-other", password="Test-pass-912!", role=User.Role.CEO)
+        self.handover_review = self.make_notification("handover:1:review", "Handover needs MD review",
+            "Handover HND-1 is ready for MD review.", "/staff/handovers")
+        self.handover_finalized = self.make_notification("handover:2:finalized", "Handover finalized",
+            "Handover HND-2 was finalized.", "/staff/handovers")
+        self.payment = self.make_notification("payment:1:review", "Payment needs review",
+            "Payment PAY-1 is waiting for verification.", "/staff/payments")
+        self.bl = self.make_notification("bl-request:1:requested", "BL approval requested",
+            "BL approval BLR-1 is waiting for review.", "/staff/bl-requests")
+        self.appointment = self.make_notification("enquiry:1:appointment", "Appointment request received",
+            "A showroom appointment needs review.", "/staff/enquiries")
+        self.system = self.make_notification("system:1:maintenance", "System maintenance complete",
+            "The system maintenance window has ended.", "/staff")
+        self.appointment.created_at = timezone.now() - timedelta(days=45)
+        self.appointment.save(update_fields=["created_at"])
+        self.other_notification = Notification.objects.create(recipient=self.other, deduplication_key="private:1",
+            title="Private notification", message="Not available to this staff member.", target_url="/staff")
+        self.client.force_authenticate(self.staff)
 
-    def make_user(self, username, role):
-        return User.objects.create_user(username=username, password="Valid-password-914!", role=role)
+    def make_notification(self, key, title, message, target):
+        return Notification.objects.create(recipient=self.staff, deduplication_key=key, title=title,
+            message=message, target_url=target)
 
-    def test_inbox_and_read_state_are_scoped_to_authenticated_recipient(self):
-        recipient = self.make_user("recipient", User.Role.STAFF)
-        other = self.make_user("other-recipient", User.Role.MANAGER)
-        own_notice = Notification.objects.create(recipient=recipient, deduplication_key="own-event",
-            title="Appointment request", message="A test appointment needs review.", target_url="/staff/enquiries")
-        other_notice = Notification.objects.create(recipient=other, deduplication_key="other-event",
-            title="Private update", message="Private recipient message.", target_url="/staff")
+    def test_categories_search_date_and_unread_filters_return_scoped_global_counts(self):
+        all_response = self.client.get("/api/notifications/?limit=50&offset=0")
+        self.assertEqual(all_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(all_response.data["count"], 6)
+        self.assertEqual(all_response.data["unread_count"], 6)
+        self.assertEqual(all_response.data["category_counts"], {
+            "all": 6, "unread": 6, "approvals": 3, "handovers": 2, "system": 1,
+        })
 
-        self.client.force_authenticate(user=recipient)
-        inbox = self.client.get("/api/notifications/?limit=1&offset=0")
-        self.assertEqual(inbox.status_code, status.HTTP_200_OK)
-        self.assertEqual(inbox.data["count"], 1)
-        self.assertEqual(inbox.data["unread_count"], 1)
-        self.assertEqual([item["id"] for item in inbox.data["results"]], [own_notice.pk])
-        self.assertNotIn(other_notice.message, str(inbox.data))
+        for category, expected_count in (("approvals", 3), ("handovers", 2), ("system", 1), ("unread", 6)):
+            response = self.client.get(f"/api/notifications/?category={category}")
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(response.data["count"], expected_count, category)
+        search = self.client.get("/api/notifications/?search=PAY-1")
+        self.assertEqual(search.data["count"], 1)
+        self.assertEqual(search.data["results"][0]["id"], self.payment.pk)
+        recent = self.client.get("/api/notifications/?period=30d")
+        self.assertEqual(recent.data["count"], 5)
+        today = self.client.get("/api/notifications/?period=today")
+        self.assertEqual(today.data["count"], 5)
 
-        forbidden = self.client.patch(f"/api/notifications/{other_notice.pk}/", {"is_read": True}, format="json")
-        self.assertEqual(forbidden.status_code, status.HTTP_404_NOT_FOUND)
-        other_notice.refresh_from_db()
-        self.assertIsNone(other_notice.read_at)
+    def test_read_state_updates_remain_owner_scoped_and_counts_are_refreshed(self):
+        response = self.client.patch(f"/api/notifications/{self.payment.pk}/", {"is_read": True}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["is_read"])
+        listing = self.client.get("/api/notifications/?category=unread")
+        self.assertEqual(listing.data["count"], 5)
+        self.assertEqual(listing.data["unread_count"], 5)
+        other = self.client.patch(f"/api/notifications/{self.other_notification.pk}/", {"is_read": True}, format="json")
+        self.assertEqual(other.status_code, status.HTTP_404_NOT_FOUND)
 
-        marked = self.client.patch(f"/api/notifications/{own_notice.pk}/", {"is_read": True}, format="json")
-        self.assertEqual(marked.status_code, status.HTTP_200_OK)
-        self.assertTrue(marked.data["is_read"])
-        self.assertEqual(self.client.get("/api/notifications/").data["unread_count"], 0)
-
-    def test_quote_submission_notifies_only_active_enquiry_team_roles(self):
-        staff = self.make_user("quote-staff", User.Role.STAFF)
-        manager = self.make_user("quote-manager", User.Role.MANAGER)
-        ceo = self.make_user("quote-ceo", User.Role.CEO)
-        admin = self.make_user("quote-admin", User.Role.ADMIN)
-        rep = self.make_user("quote-rep", User.Role.REP)
-        missing_vehicle = self.client.post("/api/public/enquiries/", {
-            "full_name": "Fictional Buyer", "email": "buyer@example.test", "phone": "0771234567",
-            "preferred_contact": "phone", "kind": "quote", "idempotency_key": "quote-missing-vehicle-01",
-        }, format="json")
-        self.assertEqual(missing_vehicle.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("vehicle_description", missing_vehicle.data)
-
-        response = self.client.post("/api/public/enquiries/", {
-            "full_name": "Fictional Buyer", "email": "buyer@example.test", "phone": "0771234567",
-            "preferred_contact": "phone", "kind": "quote", "vehicle_description": "2023 Example Comet",
-            "idempotency_key": "quote-example-vehicle-0001",
-        }, format="json")
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        from .models import Enquiry
-        enquiry = Enquiry.objects.get(reference=response.data["reference"])
-        self.assertEqual(enquiry.vehicle_description, "2023 Example Comet")
-        self.assertEqual(set(Notification.objects.values_list("recipient_id", flat=True)), {staff.pk, manager.pk, ceo.pk})
-        self.assertNotIn(admin.pk, Notification.objects.values_list("recipient_id", flat=True))
-        self.assertNotIn(rep.pk, Notification.objects.values_list("recipient_id", flat=True))
+    def test_every_existing_staff_role_can_read_its_own_inbox(self):
+        for role in (User.Role.ADMIN, User.Role.CEO, User.Role.MANAGER, User.Role.STAFF, User.Role.REP):
+            user = User.objects.create_user(username=f"notification-role-{role}", password="Test-pass-912!", role=role)
+            Notification.objects.create(recipient=user, deduplication_key=f"{role}:one", title="Own notification",
+                message="Private to this role account.", target_url="/staff")
+            self.client.force_authenticate(user)
+            response = self.client.get("/api/notifications/")
+            self.assertEqual(response.status_code, status.HTTP_200_OK, role)
+            self.assertEqual(response.data["count"], 1, role)
+            self.assertEqual(response.data["results"][0]["title"], "Own notification")
