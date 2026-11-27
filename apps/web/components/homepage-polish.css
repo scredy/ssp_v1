@@ -1,0 +1,521 @@
+/* SSP homepage-only visual refinements. */
+
+.home-public-site .home-main {
+    color: #17191c;
+    padding-bottom: 2.5rem;
+}
+
+/* Hero composition */
+
+.home-public-site .home-main .approved-home-stage {
+    height: clamp(29rem, calc(100svh - var(--approved-header-height)), 45rem);
+    min-height: 0;
+    padding-bottom: clamp(1.75rem, 4vh, 3rem);
+}
+
+.home-public-site .home-main .approved-hero {
+    overflow: hidden;
+    min-height: 0;
+}
+
+.home-public-site .home-main .approved-hero-watermark {
+    top: 6%;
+    font-size: clamp(10rem, 32vw, 38rem);
+    letter-spacing: -.08em;
+}
+
+.home-public-site .home-main .approved-hero-visual {
+    top: 50%;
+    width: min(64vw, 72rem);
+    transform: translateY(-50%);
+}
+
+.home-public-site .home-main .hero-motion-toggle {
+    left: max(1rem, calc((100vw - 82rem) / 2));
+    bottom: .65rem;
+    font-size: .72rem;
+}
+
+/* Vehicle search */
+
+.home-public-site .home-main .quick-search {
+    width: min(calc(100% - 3rem), 52rem);
+    min-height: 5rem;
+    padding: .6rem 1rem;
+    border: 1px solid #e9eaec;
+    box-shadow: 0 10px 35px rgb(17 19 21 / 8%);
+}
+
+.home-public-site .home-main .quick-search label {
+    gap: .3rem;
+    padding: 0 1rem;
+}
+
+.home-public-site .home-main .quick-search label small {
+    color: #73777c;
+    font-size: .75rem;
+    font-weight: 500;
+}
+
+.home-public-site .home-main .quick-search select {
+    font-size: .95rem;
+    font-weight: 600;
+    min-height: 1.6rem;
+}
+
+.home-public-site .home-main .quick-search select:focus-visible {
+    outline: 2px solid var(--ssp-red);
+    outline-offset: 3px;
+}
+
+/* Manufacturer carousel */
+
+.home-public-site .manufacturer-strip {
+    padding: 1.75rem 0 1.25rem;
+}
+
+.home-public-site .manufacturer-strip-heading {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    align-items: center;
+    gap: .75rem;
+    margin-bottom: 1rem;
+}
+
+.home-public-site .manufacturer-strip-heading .public-eyebrow {
+    grid-column: 2;
+    font-size: .72rem;
+    font-weight: 600;
+    letter-spacing: .1em;
+    color: #676c71;
+}
+
+.home-public-site .manufacturer-strip-heading .marquee-toggle {
+    position: static;
+    grid-column: 3;
+    justify-self: end;
+    white-space: nowrap;
+}
+
+.home-public-site .manufacturer-marquee {
+    padding: .5rem 0 .85rem;
+}
+
+.home-public-site .manufacturer-marquee-track {
+    --brand-gap: clamp(1rem, 2.5vw, 2.5rem);
+    gap: var(--brand-gap);
+    margin: 0;
+    padding-right: var(--brand-gap);
+}
+
+.home-public-site .manufacturer-marquee-track a {
+    width: 7rem;
+    height: 7rem;
+    border-radius: 1rem;
+}
+
+.home-public-site .manufacturer-logo-circle {
+    width: 6rem;
+    height: 6rem;
+    padding: .65rem;
+    font-size: .72rem;
+    font-weight: 600;
+    letter-spacing: .015em;
+    box-shadow: 0 3px 12px rgb(17 19 21 / 4%);
+    transition: border-color .2s ease;
+}
+
+.home-public-site .manufacturer-marquee-track a:hover
+.manufacturer-logo-circle {
+    border-color: var(--ssp-red);
+}
+
+/* Consistent homepage typography */
+
+.home-public-site .home-main .public-eyebrow {
+    font-weight: 650;
+    letter-spacing: .1em;
+}
+
+.home-public-site .home-main .public-section-heading h2,
+.home-public-site .home-main .business-intro h2,
+.home-public-site .home-main .home-contact h2 {
+    font-size: clamp(1.65rem, 3vw, 2.35rem);
+    font-weight: 750;
+    line-height: 1.2;
+    letter-spacing: -.035em;
+}
+
+.home-public-site .home-main .public-section-heading > div > p:last-child {
+    font-size: .95rem;
+    line-height: 1.6;
+}
+
+.home-public-site .home-main .public-text-link {
+    font-size: .85rem;
+    font-weight: 650;
+}
+
+/* Collection and featured vehicles */
+
+.home-public-site .home-main .public-section {
+    padding: clamp(2rem, 4vw, 3.5rem) 0;
+}
+
+.home-public-site .home-main .featured-section {
+    padding-top: 2rem;
+}
+
+.home-public-site .home-main .public-state {
+    min-height: 6rem;
+    display: grid;
+    place-items: center;
+    border: 1px solid #e5e7eb;
+    border-radius: .75rem;
+    background: #fafafa;
+    font-size: .9rem;
+}
+
+.home-public-site .home-main .public-state.is-error {
+    border-left: 3px solid var(--ssp-red);
+}
+
+.home-public-site .home-main .public-vehicle-card {
+    border: 1px solid #eceef0;
+    border-radius: .9rem;
+    box-shadow: 0 4px 18px rgb(17 19 21 / 5%);
+}
+
+.home-public-site .home-main .public-vehicle-copy {
+    padding: 1rem;
+}
+
+.home-public-site .home-main .public-vehicle-copy h3 {
+    font-size: 1.05rem;
+    font-weight: 700;
+    line-height: 1.4;
+}
+
+.home-public-site .home-main .public-vehicle-copy strong {
+    color: #17191c;
+    font-weight: 750;
+}
+
+/* Service cards */
+
+.home-public-site .home-main .service-grid {
+    gap: 1rem;
+    border: 0;
+}
+
+.home-public-site .home-main .service-grid article {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    min-height: 12rem;
+    padding: 1.4rem;
+    border: 1px solid #e5e7eb;
+    border-radius: .8rem;
+    background: #fff;
+}
+
+.home-public-site .home-main .service-grid h3 {
+    margin: .95rem 0 .5rem;
+    font-size: 1.05rem;
+    font-weight: 700;
+}
+
+.home-public-site .home-main .service-grid p {
+    min-height: 0;
+    margin: 0 0 1.15rem;
+    font-size: .86rem;
+    line-height: 1.65;
+}
+
+.home-public-site .home-main .service-grid a {
+    margin-top: auto;
+    font-size: .8rem;
+    font-weight: 650;
+}
+
+/* About SSP and contact section */
+
+.home-public-site .home-main .business-intro {
+    width: min(calc(100% - 3rem), 82rem);
+    margin: .75rem auto;
+    padding: clamp(1.5rem, 4vw, 3rem);
+    border: 1px solid #eceef0;
+    border-left: 3px solid var(--ssp-red);
+    border-radius: .9rem;
+    background: #f7f7f8;
+}
+
+.home-public-site .home-main .business-logo {
+    justify-self: center;
+    width: min(100%, 16rem);
+}
+
+.home-public-site .home-main .business-intro p:not(.public-eyebrow) {
+    font-size: .95rem;
+    line-height: 1.75;
+}
+
+.home-public-site .home-main .home-contact {
+    width: min(calc(100% - 3rem), 82rem);
+    padding: 2.5rem 0;
+}
+
+.home-public-site .home-main .home-contact-actions {
+    gap: .75rem;
+}
+
+.home-public-site .home-main .home-contact-actions .public-button {
+    min-height: 2.9rem;
+    padding: .75rem 1.15rem;
+    border-radius: 2rem;
+    font-weight: 650;
+}
+
+/* Homepage footer */
+
+.home-public-site .public-footer {
+    padding: 2.5rem max(1.5rem, calc((100vw - 82rem) / 2));
+}
+
+.home-public-site .public-footer-links {
+    gap: .9rem 1.25rem;
+}
+
+.home-public-site .public-footer-links a {
+    font-size: .8rem;
+    line-height: 1.5;
+}
+
+/* Tablet layout */
+
+@media (max-width: 1000px) {
+    .home-public-site .home-main .service-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+
+@media (max-width: 850px) {
+    .home-public-site .home-main .approved-home-stage {
+        height: auto;
+        min-height: 0;
+        padding-bottom: 2rem;
+    }
+
+    .home-public-site .home-main .approved-hero {
+        flex: none;
+        height: clamp(17rem, 48vw, 27rem);
+    }
+
+    .home-public-site .home-main .approved-hero-visual {
+        width: min(94vw, 48rem);
+    }
+
+    .home-public-site .home-main .approved-hero-watermark {
+        font-size: clamp(9rem, 37vw, 23rem);
+    }
+}
+
+/* Mobile layout */
+
+@media (max-width: 600px) {
+    .home-public-site .home-main .approved-hero {
+        height: clamp(14rem, 62vw, 19rem);
+    }
+
+    .home-public-site .home-main .quick-search {
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+        width: calc(100% - 2rem);
+        gap: .75rem;
+        padding: .9rem;
+        border-radius: 1rem;
+    }
+
+    .home-public-site .home-main .quick-search label {
+        padding: .2rem .35rem;
+        border-right: 0;
+    }
+
+    .home-public-site .home-main .quick-search label small {
+        font-size: .72rem;
+    }
+
+    .home-public-site .home-main .quick-search select {
+        font-size: .85rem;
+    }
+
+    .home-public-site .home-main .quick-search-submit {
+        justify-self: end;
+        width: 2.8rem;
+        height: 2.8rem;
+    }
+
+    .home-public-site .manufacturer-strip-heading {
+        display: flex;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        text-align: left;
+    }
+
+    .home-public-site .manufacturer-strip-heading .public-eyebrow {
+        font-size: .65rem;
+    }
+
+    .home-public-site .manufacturer-marquee-track a {
+        width: 5.8rem;
+        height: 5.8rem;
+    }
+
+    .home-public-site .manufacturer-logo-circle {
+        width: 5.2rem;
+        height: 5.2rem;
+        font-size: .62rem;
+    }
+
+    .home-public-site .home-main .service-grid {
+        grid-template-columns: 1fr;
+        gap: .75rem;
+    }
+
+    .home-public-site .home-main .service-grid article {
+        min-height: 0;
+        padding: 1.2rem;
+    }
+
+    .home-public-site .home-main .business-intro,
+    .home-public-site .home-main .home-contact {
+        width: calc(100% - 2rem);
+    }
+
+    .home-public-site .home-main .business-intro {
+        grid-template-columns: 1fr;
+    }
+
+    .home-public-site .home-main .business-logo {
+        width: min(100%, 12rem);
+    }
+
+    .home-public-site .home-main .home-contact-actions {
+        width: 100%;
+        align-items: stretch;
+    }
+
+    .home-public-site .public-footer {
+        padding: 2rem 1rem;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .home-public-site .manufacturer-marquee {
+        overflow-x: auto;
+    }
+
+    .home-public-site .manufacturer-logo-circle {
+        transition: none;
+    }
+}
+
+/* SSP manufacturer logo integration */
+
+.home-public-site .manufacturer-marquee-track {
+    --brand-gap: clamp(1rem, 2vw, 2rem);
+    gap: var(--brand-gap);
+    padding-right: var(--brand-gap);
+    align-items: flex-start;
+}
+
+.home-public-site .manufacturer-marquee-track a {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: flex-start;
+    flex: 0 0 auto;
+    gap: .65rem;
+    width: 7.5rem;
+    height: auto;
+    padding: .4rem .2rem;
+    text-decoration: none;
+}
+
+.home-public-site .manufacturer-logo-circle {
+    display: grid;
+    place-items: center;
+    width: 6.5rem;
+    height: 6.5rem;
+    padding: .35rem;
+    border: 1px solid #e5e7eb;
+    border-radius: 50%;
+    background: #fff;
+    box-shadow: 0 3px 14px rgb(17 19 21 / 5%);
+    transition: transform .22s ease,
+                border-color .22s ease,
+                box-shadow .22s ease;
+}
+
+.home-public-site .manufacturer-logo-circle img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+}
+
+.home-public-site .manufacturer-brand-name {
+    display: block;
+    color: #45484d;
+    font-size: .75rem;
+    font-weight: 600;
+    line-height: 1.4;
+    letter-spacing: .015em;
+    text-align: center;
+    text-transform: none;
+}
+
+.home-public-site .manufacturer-marquee-track a:hover
+.manufacturer-logo-circle,
+.home-public-site .manufacturer-marquee-track a:focus-visible
+.manufacturer-logo-circle {
+    transform: translateY(-3px);
+    border-color: var(--ssp-red);
+    box-shadow: 0 7px 18px rgb(17 19 21 / 9%);
+}
+
+.home-public-site .manufacturer-marquee-track a:hover
+.manufacturer-brand-name {
+    color: var(--ssp-red);
+}
+
+.home-public-site .manufacturer-marquee.is-moving
+.manufacturer-marquee-track {
+    animation-duration: 48s;
+}
+
+@media (max-width: 600px) {
+    .home-public-site .manufacturer-marquee-track a {
+        width: 5.5rem;
+        gap: .45rem;
+    }
+
+    .home-public-site .manufacturer-logo-circle {
+        width: 5rem;
+        height: 5rem;
+        padding: .2rem;
+    }
+
+    .home-public-site .manufacturer-brand-name {
+        font-size: .68rem;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .home-public-site .manufacturer-logo-circle {
+        transition: none;
+    }
+
+    .home-public-site .manufacturer-marquee-track a:nth-child(n+21) {
+        display: none;
+    }
+}
