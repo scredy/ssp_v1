@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { Fragment } from "react";
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { api, photoUrl, User, Vehicle } from "@/lib/car-api";
 import { BrandLogo } from "@/components/public-site";
 
@@ -28,11 +28,17 @@ export default function StaffInventoryPage() {
   const [photoPreviews, setPhotoPreviews] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+  const saveInFlight = useRef(false);
+  const [photoUploadFailed, setPhotoUploadFailed] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const canManage = user?.role === "staff";
 
-  async function refresh() { setVehicles(await api<Vehicle[]>("/api/staff/inventory/")); }
+  async function refresh() {
+    const currentVehicles = await api<Vehicle[]>("/api/staff/inventory/");
+    setVehicles(currentVehicles);
+    return currentVehicles;
+  }
   useEffect(() => {
     api<User>("/api/auth/me/").then(async (current) => {
       if (!allowedRoles.includes(current.role)) throw new Error("Your role does not have inventory access.");
@@ -58,7 +64,8 @@ export default function StaffInventoryPage() {
   }), [vehicles, query, availability, publication, makeFilter, conditionFilter]);
 
   async function saveVehicle(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault(); if (!canManage) return;
+    event.preventDefault(); if (!canManage || saveInFlight.current) return;
+    saveInFlight.current = true;
     setBusy(true); setError(""); setNotice("");
     const form = new FormData(event.currentTarget);
     const payload = Object.fromEntries(["make", "model", "variant", "manufacture_year", "mileage_km", "fuel_type", "transmission", "color", "condition", "internal_identifier", "asking_price_lkr", "description", "visibility"].map((key) => [key, form.get(key)]));
@@ -67,15 +74,44 @@ export default function StaffInventoryPage() {
       if (Number(payload.mileage_km) < 0 || Number(payload.mileage_km) > 2000000 || Number(payload.asking_price_lkr) <= 0) throw new Error("Check mileage and enter a price greater than zero.");
       if (photoFiles.length + (editing?.photos.length ?? 0) > 10) throw new Error("A vehicle can have at most 10 photos.");
       let saved: Vehicle;
-      if (editing) saved = await api<Vehicle>(`/api/staff/inventory/${editing.reference}/`, { method: "PATCH", body: JSON.stringify(payload) });
-      else saved = await api<Vehicle>("/api/staff/inventory/", { method: "POST", body: JSON.stringify(payload) });
+      if (editing) {
+        saved = await api<Vehicle>(`/api/staff/inventory/${editing.reference}/`, { method: "PATCH", body: JSON.stringify(payload) });
+      } else {
+        saved = await api<Vehicle>("/api/staff/inventory/", { method: "POST", body: JSON.stringify(payload) });
+        // Keep the vehicle reference before the separate photo request starts.
+        setEditing(saved);
+        setCreating(false);
+      }
       if (photoFiles.length) {
         const photoData = new FormData(); photoFiles.forEach((file) => photoData.append("photos", file));
-        saved = await api<Vehicle>(`/api/staff/inventory/${saved.reference}/photos/`, { method: "POST", body: photoData });
+        try {
+          saved = await api<Vehicle>(`/api/staff/inventory/${saved.reference}/photos/`, { method: "POST", body: photoData });
+        } catch {
+          setPhotoUploadFailed(true);
+          setEditing(saved);
+          setCreating(false);
+          await refresh().catch(() => undefined);
+          setError("Vehicle details saved successfully, but photographs could not be uploaded. Retry uploading photographs to complete this vehicle.");
+          return;
+        }
       }
-      await refresh(); setEditing(null); setCreating(false); setPhotoFiles([]); setNotice(`Saved ${saved.reference}.`);
-    } catch (cause) { setError(cause instanceof Error ? cause.message : "Unable to save this vehicle."); }
-    finally { setBusy(false); }
+      await refresh(); setEditing(null); setCreating(false); setPhotoFiles([]); setPhotoUploadFailed(false); setNotice(`Saved ${saved.reference}.`);
+    } catch (cause) {
+      if (!editing && cause instanceof Error && /unavailable|try again|failed \(5\d\d\)/i.test(cause.message)) {
+        try {
+          const currentVehicles = await refresh();
+          const identifier = String(payload.internal_identifier ?? "").trim();
+          const possibleSave = currentVehicles.find((vehicle) => vehicle.internal_identifier?.trim() === identifier);
+          if (possibleSave) {
+            setEditing(possibleSave);
+            setCreating(false);
+            setError("The create request may have succeeded, and the matching vehicle is now in edit mode. Check its details before retrying.");
+            return;
+          }
+        } catch { /* Keep the original network error below. */ }
+      }
+      setError(cause instanceof Error ? cause.message : "Unable to save this vehicle.");
+    } finally { saveInFlight.current = false; setBusy(false); }
   }
 
   async function togglePublication(vehicle: Vehicle) {
@@ -123,10 +159,10 @@ export default function StaffInventoryPage() {
       <label>Publication<select value={publication} onChange={(event) => setPublication(event.target.value)}><option value="">All listings</option><option value="published">Published</option><option value="draft">Draft</option></select></label>
       <label>Make<select value={makeFilter} onChange={(event) => setMakeFilter(event.target.value)}><option value="">All makes</option>{makes.map((make) => <option key={make}>{make}</option>)}</select></label>
       <label>Condition<select value={conditionFilter} onChange={(event) => setConditionFilter(event.target.value)}><option value="">All conditions</option><option value="new">New</option><option value="used">Used</option><option value="reconditioned">Reconditioned</option></select></label>
-      {canManage && <button className="inventory-primary" onClick={() => { setEditing(null); setCreating(true); setPhotoFiles([]); setError(""); setNotice(""); }}>+ Add vehicle</button>}
+      {canManage && <button className="inventory-primary" onClick={() => { setEditing(null); setCreating(true); setPhotoFiles([]); setPhotoUploadFailed(false); setError(""); setNotice(""); }}>+ Add vehicle</button>}
     </section>
     {(creating || editing) && <form className="vehicle-form inventory-form" onSubmit={saveVehicle} key={editing?.reference ?? "new"}>
-      <div className="form-heading"><div><p className="eyebrow">{editing ? `EDIT ${editing.reference}` : "NEW VEHICLE"}</p><h2>{editing ? "Update vehicle details" : "Add vehicle"}</h2></div><button type="button" className="inventory-secondary" onClick={() => { setEditing(null); setCreating(false); setPhotoFiles([]); }}>Cancel</button></div>
+      <div className="form-heading"><div><p className="eyebrow">{editing ? `EDIT ${editing.reference}` : "NEW VEHICLE"}</p><h2>{editing ? "Update vehicle details" : "Add vehicle"}</h2></div><button type="button" className="inventory-secondary" onClick={() => { setEditing(null); setCreating(false); setPhotoFiles([]); setPhotoUploadFailed(false); }}>Cancel</button></div>
       <div className="vehicle-form-grid">
         <label>Make<input name="make" required maxLength={80} defaultValue={editing?.make ?? blank.make} /></label><label>Model<input name="model" required maxLength={100} defaultValue={editing?.model ?? blank.model} /></label><label>Variant / grade<input name="variant" maxLength={120} defaultValue={editing?.variant ?? blank.variant} /></label>
         <label>Manufacture year<input name="manufacture_year" type="number" required min="1886" max={new Date().getFullYear() + 1} defaultValue={editing?.manufacture_year ?? blank.manufacture_year} /></label><label>Mileage (km)<input name="mileage_km" type="number" required min="0" max="2000000" defaultValue={editing?.mileage_km ?? blank.mileage_km} /></label>
@@ -139,12 +175,12 @@ export default function StaffInventoryPage() {
       </div>
       {photoPreviews.length > 0 && <section className="photo-preview-grid" aria-label="Selected photograph previews">{photoPreviews.map((url, index) => <div key={`${url}-${index}`}><img src={url} alt={`Selected vehicle photo ${index + 1}`} /><span>New photo {index + 1}</span><button type="button" className="inventory-text-button" onClick={() => setPhotoFiles((files) => files.filter((_, fileIndex) => fileIndex !== index))}>Remove</button></div>)}</section>}
       {editing?.photos.length ? <section className="photo-preview-grid existing-photos" aria-label="Current vehicle photographs"><h3>Current photographs</h3>{editing.photos.map((photo) => <div key={photo.id}><img src={photoUrl(photo)} alt="Vehicle" />{canManage && <button type="button" className="inventory-text-button" disabled={busy} onClick={() => void removePhoto(editing, photo.id)}>Remove</button>}</div>)}</section> : null}
-      <button className="inventory-primary" disabled={busy}>{busy ? "Saving…" : editing ? "Save changes" : "Create vehicle"}</button>
+      <button className="inventory-primary" disabled={busy}>{busy ? "Saving…" : photoUploadFailed ? "Retry photo upload" : editing ? "Save changes" : "Create vehicle"}</button>
     </form>}
     <section className="inventory-table-wrap" aria-live="polite">
       {vehicles.length === 0 ? <p className="inventory-empty">No vehicle records yet.{canManage ? " Add a vehicle to start building inventory." : ""}</p> : filtered.length === 0 ? <p className="inventory-empty">No vehicles match these filters.</p> : <table className="inventory-table"><thead><tr><th>Vehicle</th><th>Reference</th><th>Condition</th><th>Availability</th><th>Publication</th><th>Price</th><th>Actions</th></tr></thead><tbody>{filtered.map((vehicle) =>
         <Fragment key={vehicle.reference}><tr><td><div className="inventory-vehicle-cell">{vehicle.photos[0] ? <img src={photoUrl(vehicle.photos[0])} alt="" /> : <span className="inventory-image-placeholder">SSP</span>}<span><strong>{vehicle.manufacture_year} {vehicle.make} {vehicle.model}</strong><small>{vehicle.variant || "Standard"} · {vehicle.mileage_km.toLocaleString()} km</small></span></div></td><td>{vehicle.reference}</td><td>{vehicle.condition}</td><td><span className={`stock-status stock-${vehicle.status}`}>{statusLabels[vehicle.status ?? "available"] ?? vehicle.status}</span></td><td><span className={`publication-status publication-${vehicle.visibility}`}>{vehicle.visibility}</span></td><td>{currency(vehicle.asking_price_lkr)}</td>
-          <td><div className="inventory-actions"><button className="inventory-secondary" onClick={() => setDetails(details === vehicle.reference ? null : vehicle.reference)}>{details === vehicle.reference ? "Hide" : "Details"}</button>{canManage && <>{vehicle.status === "available" && <Link className="inventory-secondary" href={`/staff/reservations?vehicle=${encodeURIComponent(vehicle.reference)}`}>Reserve</Link>}<button className="inventory-secondary" disabled={busy} onClick={() => { setEditing(vehicle); setCreating(false); setPhotoFiles([]); setError(""); setNotice(""); }}>Edit</button><button className="inventory-secondary" disabled={busy || (vehicle.status !== "available" && vehicle.visibility !== "published")} onClick={() => void togglePublication(vehicle)}>{vehicle.visibility === "published" ? "Unpublish" : "Publish"}</button>{vehicle.status === "available" ? <button className="inventory-danger" disabled={busy} onClick={() => void changeStatus(vehicle, "archived")}>Archive</button> : vehicle.status === "archived" ? <button className="inventory-secondary" disabled={busy} onClick={() => void changeStatus(vehicle, "available")}>Restore</button> : <span className="inventory-help">Lifecycle locked</span>}</>}</div></td></tr>
+          <td><div className="inventory-actions"><button className="inventory-secondary" onClick={() => setDetails(details === vehicle.reference ? null : vehicle.reference)}>{details === vehicle.reference ? "Hide" : "Details"}</button>{canManage && <>{vehicle.status === "available" && <Link className="inventory-secondary" href={`/staff/reservations?vehicle=${encodeURIComponent(vehicle.reference)}`}>Reserve</Link>}<button className="inventory-secondary" disabled={busy} onClick={() => { setEditing(vehicle); setCreating(false); setPhotoFiles([]); setPhotoUploadFailed(false); setError(""); setNotice(""); }}>Edit</button><button className="inventory-secondary" disabled={busy || (vehicle.status !== "available" && vehicle.visibility !== "published")} onClick={() => void togglePublication(vehicle)}>{vehicle.visibility === "published" ? "Unpublish" : "Publish"}</button>{vehicle.status === "available" ? <button className="inventory-danger" disabled={busy} onClick={() => void changeStatus(vehicle, "archived")}>Archive</button> : vehicle.status === "archived" ? <button className="inventory-secondary" disabled={busy} onClick={() => void changeStatus(vehicle, "available")}>Restore</button> : <span className="inventory-help">Lifecycle locked</span>}</>}</div></td></tr>
         {details === vehicle.reference && <tr className="inventory-detail"><td colSpan={7}><div className="inventory-detail-content"><p><strong>Color:</strong> {vehicle.color} · <strong>Fuel:</strong> {vehicle.fuel_type} · <strong>Transmission:</strong> {vehicle.transmission}</p><p><strong>Internal identifier:</strong> {canManage ? vehicle.internal_identifier : "Hidden for read-only review"}</p>{vehicle.description && <p>{vehicle.description}</p>}<div className="detail-photo-strip">{vehicle.photos.map((photo) => <img key={photo.id} src={photoUrl(photo)} alt={`${vehicle.make} ${vehicle.model}`} />)}</div></div></td></tr>}</Fragment>
       )}</tbody></table>}
     </section>

@@ -320,10 +320,14 @@ class VehiclePhoto(models.Model):
     vehicle = models.ForeignKey(Vehicle, on_delete=models.CASCADE, related_name="photos")
     image = models.FileField(upload_to=vehicle_photo_path)
     content_type = models.CharField(max_length=30)
+    content_sha256 = models.CharField(max_length=64, null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         ordering = ["id"]
+        constraints = [models.UniqueConstraint(
+            fields=("vehicle", "content_sha256"), name="unique_vehicle_photo_content"
+        )]
 
 
 class Sale(models.Model):

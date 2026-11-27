@@ -81,7 +81,17 @@ If no production Admin exists, run `python manage.py createsuperuser` through th
 
 ## Uploaded media persistence
 
-Render's service filesystem is ephemeral unless a persistent disk is attached. Attach a persistent disk mounted at `/var/data` and set all three paths below to directories on that disk to retain vehicle photos and private payment/handover evidence across deploys:
+Render Free Web Services have an ephemeral filesystem and do not support persistent disks. A configured path such as `/var/data/media` only works when `/var/data` is mounted and writable; without that mount, upload writes can fail. The provided production 500 status does not reveal the exception, so use the new safe `accounts.views` storage diagnostic (`category`, `phase`, exception type and errno) to confirm whether the failure is permission denied, missing mount, full storage, or another I/O error. The upload response now returns 503 rather than an unclassified 500 for storage failures.
+
+For a **non-production temporary test only**, a Free instance can use its ephemeral `/tmp` filesystem. This checks whether the rest of the upload flow works but does not retain files through restart, spin-down, or redeploy. Never use these paths for live vehicle media or private financial evidence:
+
+```text
+MEDIA_ROOT=/tmp/ssp/media
+PRIVATE_PAYMENT_EVIDENCE_ROOT=/tmp/ssp/private_payment_evidence
+PRIVATE_HANDOVER_EVIDENCE_ROOT=/tmp/ssp/private_handover_evidence
+```
+
+Render persistent disks preserve local files, but are only available on paid services. Attach a disk mounted at `/var/data` and set all three paths below to directories on that disk to retain vehicle photos and private payment/handover evidence across deploys:
 
 ```text
 MEDIA_ROOT=/var/data/media
@@ -90,3 +100,9 @@ PRIVATE_HANDOVER_EVIDENCE_ROOT=/var/data/private_handover_evidence
 ```
 
 Private evidence remains outside the public media directory and is served only through the existing permission-checked API. Without the disk and these variables, uploaded files can be lost when Render replaces the instance. Back up the disk separately; a disk mounted by one instance also needs a deliberate storage design before scaling to multiple instances.
+
+### Lower-cost durable object storage option
+
+For a small catalogue while keeping Render Web Services Free, Cloudflare R2 is the recommended next storage implementation: use a **private** bucket and Django-only S3-compatible credentials. Put vehicle photos, payment evidence, and handover evidence in separate prefixes (or separate private buckets). Keep photo reads and private document reads behind Django's existing permission-checked endpoints; do not expose R2 credentials or public object URLs in the frontend. This preserves draft/reserved/sold/archived photo access rules and private evidence checks. Required backend configuration would be an R2 account ID/endpoint, bucket, access key ID, secret access key, and region `auto`, followed by a Django storage adapter and a migration plan for existing files. No provider has been enabled by this change.
+
+Cloudflare's current R2 Standard rate is $0.015/GB-month with 10 GB-month, 1 million Class A requests and 10 million Class B requests included monthly; internet egress is free. Render lists persistent disks at $0.25/GB-month, in addition to moving the backend to a paid plan. Cloudinary's image-oriented free plan uses 25 monthly credits across storage, image bandwidth and transformations, and is therefore less predictable as the catalogue grows; private evidence would still need an authenticated/private delivery design. R2 is the lowest-cost fit for a private, single-storage architecture, while Render disks are the simpler option if upgrading backend compute is acceptable.

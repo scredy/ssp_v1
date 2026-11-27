@@ -14,13 +14,16 @@ from datetime import datetime, time
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import date, timedelta
 from hashlib import sha256
+import errno
+import hashlib
+import logging
 from secrets import token_urlsafe
 from urllib.parse import urlencode
 from PIL import Image, UnidentifiedImageError
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_protect, ensure_csrf_cookie
 from rest_framework import status
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import APIException, NotFound, ValidationError
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
@@ -51,6 +54,33 @@ from .payment_summaries import sale_payment_summary
 from .finance_estimates import calculate_finance_estimate, finance_options
 from .serializers import (BLApprovalDecisionSerializer, BLApprovalRequestCreateSerializer, BLApprovalRequestSerializer,
                           ImportMilestoneCreateSerializer, ImportMilestoneSerializer, ImportOrderSerializer)
+
+logger = logging.getLogger(__name__)
+
+
+class PhotoStorageUnavailable(APIException):
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    default_detail = "Photograph storage is temporarily unavailable."
+    default_code = "photo_storage_unavailable"
+
+
+def _photo_storage_category(exc):
+    if isinstance(exc, PermissionError):
+        return "permission_denied"
+    if exc.errno == errno.ENOSPC:
+        return "storage_full"
+    if exc.errno == errno.EROFS:
+        return "read_only_filesystem"
+    if exc.errno == errno.ENOENT:
+        return "storage_path_unavailable"
+    return "storage_io_error"
+
+
+def _log_photo_storage_error(exc, phase):
+    logger.error(
+        "Vehicle photo storage failure category=%s phase=%s exception_type=%s errno=%s",
+        _photo_storage_category(exc), phase, type(exc).__name__, getattr(exc, "errno", None),
+    )
 
 
 class PublicEnquiryThrottle(AnonRateThrottle):
@@ -2227,12 +2257,10 @@ class StaffVehiclePhotosView(APIView):
     formats = {"JPEG": "image/jpeg", "PNG": "image/png", "WEBP": "image/webp"}
 
     def post(self, request, reference):
-        vehicle = get_object_or_404(Vehicle, reference=reference)
+        vehicle = get_object_or_404(Vehicle.objects.prefetch_related("photos"), reference=reference)
         uploads = request.FILES.getlist("photos")
         if not uploads:
             raise ValidationError({"photos": "Select at least one image."})
-        if len(uploads) + vehicle.photos.count() > self.max_photos:
-            raise ValidationError({"photos": f"A vehicle can have at most {self.max_photos} photos."})
         validated = []
         for upload in uploads:
             if upload.size <= 0 or upload.size > self.max_photo_bytes:
@@ -2247,16 +2275,85 @@ class StaffVehiclePhotosView(APIView):
                 image.verify()
                 upload.seek(0)
                 validated.append((upload, self.formats[image.format]))
-            except (UnidentifiedImageError, OSError, SyntaxError, Image.DecompressionBombError):
+            except (UnidentifiedImageError, OSError, SyntaxError, ValueError, Image.DecompressionBombError):
                 raise ValidationError({"photos": "An uploaded file is not a valid supported image."})
             finally:
                 upload.seek(0)
-        photos = [VehiclePhoto.objects.create(vehicle=vehicle, image=upload, content_type=content_type)
-                  for upload, content_type in validated]
-        AuditEvent.objects.create(actor=request.user, action="inventory.photos.uploaded", subject=vehicle.reference,
-                                  details={"count": len(photos)})
+        storage_names = []
+        try:
+            with transaction.atomic():
+                vehicle = Vehicle.objects.select_for_update().get(pk=vehicle.pk)
+                existing = list(VehiclePhoto.objects.filter(vehicle=vehicle).only(
+                    "id", "image", "content_sha256", "content_type"
+                ))
+                existing_hashes = {photo.content_sha256 for photo in existing if photo.content_sha256}
+                for photo in existing:
+                    if photo.content_sha256:
+                        continue
+                    try:
+                        digest = hashlib.sha256()
+                        with photo.image.open("rb") as current_image:
+                            for chunk in iter(lambda: current_image.read(1024 * 1024), b""):
+                                digest.update(chunk)
+                        photo.content_sha256 = digest.hexdigest()
+                        photo.save(update_fields=("content_sha256",))
+                        existing_hashes.add(photo.content_sha256)
+                    except FileNotFoundError:
+                        logger.warning("Vehicle photo record references a missing file; photo_id=%s", photo.pk)
+
+                new_uploads = []
+                for upload, content_type in validated:
+                    digest = hashlib.sha256()
+                    for chunk in upload.chunks():
+                        digest.update(chunk)
+                    upload.seek(0)
+                    digest_value = digest.hexdigest()
+                    if digest_value in existing_hashes:
+                        continue
+                    existing_hashes.add(digest_value)
+                    new_uploads.append((upload, content_type, digest_value))
+
+                if len(existing) + len(new_uploads) > self.max_photos:
+                    raise ValidationError({"photos": f"A vehicle can have at most {self.max_photos} photos."})
+
+                for upload, content_type, digest_value in new_uploads:
+                    photo = VehiclePhoto(vehicle=vehicle, content_type=content_type, content_sha256=digest_value)
+                    expected_name = photo.image.field.generate_filename(photo, upload.name)
+                    storage_names.append((photo.image.storage, expected_name))
+                    saved_name = photo.image.storage.save(expected_name, upload)
+                    storage_names.append((photo.image.storage, saved_name))
+                    photo.image.name = saved_name
+                    photo.save(force_insert=True)
+
+                if new_uploads:
+                    AuditEvent.objects.create(actor=request.user, action="inventory.photos.uploaded", subject=vehicle.reference,
+                                              details={"count": len(new_uploads)})
+        except ValidationError:
+            raise
+        except OSError as exc:
+            _log_photo_storage_error(exc, "write")
+            self._cleanup_photo_storage(storage_names)
+            raise PhotoStorageUnavailable(
+                "Vehicle details are saved, but photographs could not be stored. Retry the upload."
+            ) from None
+        except Exception as exc:
+            logger.error("Vehicle photo upload failed category=processing_error exception_type=%s", type(exc).__name__)
+            self._cleanup_photo_storage(storage_names)
+            raise PhotoStorageUnavailable(
+                "Vehicle details are saved, but photographs could not be uploaded. Retry the upload."
+            ) from None
+
+        vehicle = Vehicle.objects.prefetch_related("photos").get(pk=vehicle.pk)
         return Response(StaffVehicleSerializer(vehicle, context={"request": request}).data,
-                        status=status.HTTP_201_CREATED)
+                        status=status.HTTP_201_CREATED if new_uploads else status.HTTP_200_OK)
+
+    @staticmethod
+    def _cleanup_photo_storage(storage_names):
+        for storage, name in dict.fromkeys(storage_names):
+            try:
+                storage.delete(name)
+            except OSError as exc:
+                _log_photo_storage_error(exc, "cleanup")
 
 
 class StaffVehiclePhotoDetailView(APIView):
@@ -2318,9 +2415,16 @@ class VehiclePhotoView(APIView):
         photo = get_object_or_404(VehiclePhoto.objects.select_related("vehicle"), pk=photo_id)
         if photo.vehicle.visibility != Vehicle.Visibility.PUBLISHED or photo.vehicle.status != Vehicle.Status.AVAILABLE:
             if not request.user.is_authenticated or request.user.role not in {"staff", "ceo", "manager"}:
-                from rest_framework.exceptions import NotFound
                 raise NotFound()
-        response = FileResponse(photo.image.open("rb"), content_type=photo.content_type)
+        try:
+            photo_file = photo.image.open("rb")
+        except FileNotFoundError:
+            logger.warning("Vehicle photo record references a missing file; photo_id=%s", photo.pk)
+            raise NotFound("This photograph is currently unavailable.") from None
+        except OSError as exc:
+            _log_photo_storage_error(exc, "read")
+            raise PhotoStorageUnavailable("This photograph is temporarily unavailable.") from None
+        response = FileResponse(photo_file, content_type=photo.content_type)
         response["X-Content-Type-Options"] = "nosniff"
         response["Content-Disposition"] = f'inline; filename="vehicle-photo-{photo.pk}"'
         # Do not let a formerly published image remain cached after unpublishing.
