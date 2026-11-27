@@ -20,6 +20,7 @@ export default function CarsCatalogue() {
   const [maxPrice, setMaxPrice] = useState("");
   const [fuel, setFuel] = useState("");
   const [transmission, setTransmission] = useState("");
+  const [condition, setCondition] = useState("");
   const [sort, setSort] = useState("latest");
 
   async function load() {
@@ -29,13 +30,17 @@ export default function CarsCatalogue() {
     finally { setLoading(false); }
   }
   useEffect(() => { void load(); }, []);
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    setMake(params.get("make") ?? ""); setModel(params.get("model") ?? ""); setCondition(params.get("condition") ?? "");
+  }, []);
   const makes = useMemo(() => [...new Set(cars.map((car) => car.make))].sort(), [cars]);
   const models = useMemo(() => [...new Set(cars.filter((car) => !make || car.make === make).map((car) => car.model))].sort(), [cars, make]);
   const results = useMemo(() => {
     const needle = search.trim().toLowerCase();
     const matching = cars.filter((car) =>
       (!needle || `${car.make} ${car.model} ${car.variant}`.toLowerCase().includes(needle)) &&
-      (!make || car.make === make) && (!model || car.model === model) &&
+      (!make || car.make === make) && (!model || car.model === model) && (!condition || car.condition === condition) &&
       (!yearFrom || car.manufacture_year >= Number(yearFrom)) && (!yearTo || car.manufacture_year <= Number(yearTo)) &&
       (!minPrice || Number(car.asking_price_lkr) >= Number(minPrice)) && (!maxPrice || Number(car.asking_price_lkr) <= Number(maxPrice)) &&
       (!fuel || car.fuel_type === fuel) && (!transmission || car.transmission === transmission)
@@ -44,9 +49,9 @@ export default function CarsCatalogue() {
       : sort === "price-high" ? Number(b.asking_price_lkr) - Number(a.asking_price_lkr)
       : sort === "year-new" ? b.manufacture_year - a.manufacture_year
       : (b.created_at ?? "").localeCompare(a.created_at ?? ""));
-  }, [cars, search, make, model, yearFrom, yearTo, minPrice, maxPrice, fuel, transmission, sort]);
+  }, [cars, search, make, model, condition, yearFrom, yearTo, minPrice, maxPrice, fuel, transmission, sort]);
 
-  function clearFilters() { setSearch(""); setMake(""); setModel(""); setYearFrom(""); setYearTo(""); setMinPrice(""); setMaxPrice(""); setFuel(""); setTransmission(""); setSort("latest"); }
+  function clearFilters() { setSearch(""); setMake(""); setModel(""); setCondition(""); setYearFrom(""); setYearTo(""); setMinPrice(""); setMaxPrice(""); setFuel(""); setTransmission(""); setSort("latest"); }
 
   return <PublicPageFrame active="/cars"><main className="public-main catalogue-main">
     <nav className="public-breadcrumb" aria-label="Breadcrumb"><Link href="/">Home</Link><span aria-hidden="true">›</span><span aria-current="page">Vehicles</span></nav>
@@ -54,6 +59,7 @@ export default function CarsCatalogue() {
       <label>Search<input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Make or model" /></label>
       <label>Make<select value={make} onChange={(event) => { setMake(event.target.value); setModel(""); }}><option value="">All makes</option>{makes.map((value) => <option key={value}>{value}</option>)}</select></label>
       <label>Model<select value={model} onChange={(event) => setModel(event.target.value)}><option value="">All models</option>{models.map((value) => <option key={value}>{value}</option>)}</select></label>
+      <label>Condition<select value={condition} onChange={(event) => setCondition(event.target.value)}><option value="">New &amp; used</option>{[...new Set(cars.map((car) => car.condition))].sort().map((value) => <option key={value}>{value}</option>)}</select></label>
       <div className="filter-pair"><label>Year from<input type="number" min="1886" value={yearFrom} onChange={(event) => setYearFrom(event.target.value)} placeholder="Any" /></label><label>To<input type="number" min="1886" value={yearTo} onChange={(event) => setYearTo(event.target.value)} placeholder="Any" /></label></div>
       <div className="filter-pair"><label>Price min (LKR)<input type="number" min="0" value={minPrice} onChange={(event) => setMinPrice(event.target.value)} placeholder="Any" /></label><label>Max<input type="number" min="0" value={maxPrice} onChange={(event) => setMaxPrice(event.target.value)} placeholder="Any" /></label></div>
       <label>Fuel<select value={fuel} onChange={(event) => setFuel(event.target.value)}><option value="">All fuel types</option><option value="petrol">Petrol</option><option value="diesel">Diesel</option><option value="hybrid">Hybrid</option><option value="electric">Electric</option><option value="other">Other</option></select></label>
