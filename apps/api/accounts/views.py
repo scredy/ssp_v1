@@ -485,6 +485,10 @@ class NotificationDetailView(APIView):
         notification.save(update_fields=["read_at"])
         return Response(NotificationSerializer(notification).data)
 
+def _can_manage_admin_accounts(user):
+    return bool(user and user.is_authenticated and user.is_active and user.is_superuser and user.role == User.Role.ADMIN)
+
+
 class AccountListCreateView(APIView):
     permission_classes = [HasCapability]
     required_capability = "accounts.manage"
@@ -493,6 +497,11 @@ class AccountListCreateView(APIView):
         return Response(AccountSummarySerializer(User.objects.order_by("username"), many=True).data)
 
     def post(self, request):
+        if request.data.get("role") == User.Role.ADMIN and not _can_manage_admin_accounts(request.user):
+            return Response({"role": "Only a Django superuser can create an Admin account."}, status=status.HTTP_403_FORBIDDEN)
+        forbidden_fields = {"is_superuser", "is_staff", "groups", "user_permissions"}.intersection(request.data.keys())
+        if forbidden_fields:
+            return Response({field: "Privilege fields cannot be set through account management." for field in sorted(forbidden_fields)}, status=status.HTTP_400_BAD_REQUEST)
         if "password" in request.data:
             return Response({"password": "Passwords are set through the secure invitation flow."}, status=status.HTTP_400_BAD_REQUEST)
         serializer = AccountSerializer(data=request.data)
@@ -501,7 +510,7 @@ class AccountListCreateView(APIView):
             with transaction.atomic():
                 user = serializer.save()
                 AuditEvent.objects.create(actor=request.user, action="account.created", subject=user.username,
-                    details={"role": user.role, "account_type": user.account_type})
+                    details={"role": user.role, "account_type": user.account_type, "is_superuser": False})
                 issue_account_action_token(user, AccountActionToken.Kind.INVITATION, request.user)
         except AccountEmailDeliveryError:
             return Response({"detail": "The invitation email could not be sent. No account was created; check email configuration and try again."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
@@ -521,30 +530,42 @@ class AccountDetailView(APIView):
             user = self.get_object(account_id)
         except User.DoesNotExist:
             return Response({"detail": "Account not found."}, status=status.HTTP_404_NOT_FOUND)
-        if user.role == User.Role.ADMIN and user.pk != request.user.pk:
-            return Response({"detail": "Admin accounts can only be managed by their own account."},
+        privileged_manager = _can_manage_admin_accounts(request.user)
+        if user.is_superuser and user.pk != request.user.pk:
+            return Response({"detail": "Django superuser accounts cannot be modified through account management."},
                             status=status.HTTP_403_FORBIDDEN)
+        if user.role == User.Role.ADMIN and not privileged_manager and user.pk != request.user.pk:
+            return Response({"detail": "Admin accounts can only be managed by a Django superuser."},
+                            status=status.HTTP_403_FORBIDDEN)
+        forbidden_fields = {"is_superuser", "is_staff", "groups", "user_permissions"}.intersection(request.data.keys())
+        if forbidden_fields:
+            return Response({field: "Privilege fields cannot be changed through account management." for field in sorted(forbidden_fields)}, status=status.HTTP_400_BAD_REQUEST)
         if "password" in request.data:
             return Response({"password": "Passwords can only be changed with a valid invitation or reset link."}, status=status.HTTP_400_BAD_REQUEST)
-        if user.role == User.Role.ADMIN and "role" in request.data and request.data["role"] != User.Role.ADMIN:
-            return Response({"role": "The Admin role cannot be changed through account management."}, status=status.HTTP_400_BAD_REQUEST)
         if user.pk == request.user.pk and request.data.get("is_active") is False:
             return Response({"detail": "You cannot deactivate your own account."},
                             status=status.HTTP_400_BAD_REQUEST)
+        if user.is_superuser and ("role" in request.data or "is_active" in request.data):
+            return Response({"detail": "Django superuser role and activation are protected."}, status=status.HTTP_400_BAD_REQUEST)
+        if user.role == User.Role.ADMIN and not privileged_manager and ("role" in request.data or "is_active" in request.data):
+            return Response({"detail": "Only a Django superuser can change Admin role or activation."}, status=status.HTTP_403_FORBIDDEN)
+        if "role" in request.data and request.data["role"] == User.Role.ADMIN and not privileged_manager:
+            return Response({"role": "Only a Django superuser can assign the Admin role."}, status=status.HTTP_403_FORBIDDEN)
         if not user.is_active and request.data.get("is_active") is True and not user.has_usable_password():
             return Response({"is_active": "The user must complete the invitation and set a password before activation."}, status=status.HTTP_400_BAD_REQUEST)
         serializer = AccountUpdateSerializer(user, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         old_role, old_active, old_email = user.role, user.is_active, user.email
-        if old_active and request.data.get("is_active") is False and old_role == User.Role.ADMIN:
-            active_admins = list(User.objects.select_for_update().filter(role=User.Role.ADMIN, is_active=True).values_list("pk", flat=True))
-            if len(active_admins) <= 1:
-                return Response({"is_active": "The last active Admin account cannot be deactivated."}, status=status.HTTP_400_BAD_REQUEST)
+        if old_active and request.data.get("is_active") is False and user.is_superuser:
+            active_superusers = User.objects.select_for_update().filter(is_superuser=True, is_active=True).count()
+            if active_superusers <= 1:
+                return Response({"is_active": "The last active Django superuser cannot be deactivated."}, status=status.HTTP_400_BAD_REQUEST)
         updated = serializer.save()
         if old_active != updated.is_active or old_email != updated.email:
             AccountActionToken.objects.filter(user=updated, used_at__isnull=True).update(used_at=timezone.now())
         AuditEvent.objects.create(actor=request.user, action="account.updated", subject=updated.username,
-                                  details={"role": updated.role, "account_type": updated.account_type})
+                                  details={"role": updated.role, "account_type": updated.account_type,
+                                           "is_superuser": updated.is_superuser})
         if old_active != updated.is_active:
             AuditEvent.objects.create(actor=request.user, action="account.activated" if updated.is_active else "account.deactivated",
                 subject=updated.username, details={"is_active": updated.is_active})
@@ -563,8 +584,10 @@ class AccountAccessLinkView(APIView):
             user = User.objects.get(pk=account_id)
         except User.DoesNotExist:
             return Response({"detail": "Account not found."}, status=status.HTTP_404_NOT_FOUND)
-        if user.role == User.Role.ADMIN:
-            return Response({"detail": "Admin access links are not issued through account management."}, status=status.HTTP_403_FORBIDDEN)
+        if user.is_superuser:
+            return Response({"detail": "Django superuser access links are not issued through account management."}, status=status.HTTP_403_FORBIDDEN)
+        if user.role == User.Role.ADMIN and not _can_manage_admin_accounts(request.user):
+            return Response({"detail": "Only a Django superuser can manage Admin access links."}, status=status.HTTP_403_FORBIDDEN)
         kind = request.data.get("kind")
         if kind == AccountActionToken.Kind.INVITATION:
             if user.is_active or user.has_usable_password():
@@ -668,8 +691,8 @@ class AuditHistoryPagination(LimitOffsetPagination):
 
 
 AUDIT_SAFE_DETAIL_FIELDS = {
-    "account.created": ("role", "account_type"),
-    "account.updated": ("role", "account_type"),
+    "account.created": ("role", "account_type", "is_superuser"),
+    "account.updated": ("role", "account_type", "is_superuser"),
     "account.invitation_sent": ("kind", "expires_at"),
     "account.password_reset_sent": ("kind", "expires_at"),
     "account.activated": ("is_active", "activation_method"),

@@ -8,9 +8,9 @@ import { BrandLogo } from "@/components/public-site";
 
 type Account = {
   id: number; username: string; first_name: string; last_name: string; email: string;
-  phone: string | null; role: string; account_type: "internal" | "external"; is_active: boolean; is_onboarded: boolean;
+  phone: string | null; role: string; account_type: "internal" | "external"; is_active: boolean; is_onboarded: boolean; is_superuser: boolean;
 };
-type CurrentUser = { id: number; role: string };
+type CurrentUser = { id: number; role: string; is_superuser: boolean };
 
 const roles = [
   { value: "ceo", label: "CEO" },
@@ -86,7 +86,13 @@ export default function AccountsPage() {
       account_type: editing ? String(form.get("account_type") ?? editing.account_type) : "internal",
     };
     if (editing) common.username = String(form.get("username") ?? "").trim();
-    if (!editing || editing.role !== "admin") common.role = String(form.get("role") ?? "");
+    if (!editing || (editing.role !== "admin" && !editing.is_superuser) || (currentUser?.is_superuser && !editing.is_superuser)) {
+      common.role = String(form.get("role") ?? "");
+      if (editing && common.role !== editing.role && (common.role === "admin" || editing.role === "admin")) {
+        const action = common.role === "admin" ? "promote this user to Admin" : "remove this user's Admin role";
+        if (!window.confirm(`Confirm you want to ${action}? Admin accounts can manage all SSP accounts.`)) { setBusy(false); return; }
+      }
+    }
     try {
       let saved: Account;
       if (editing) {
@@ -131,11 +137,11 @@ export default function AccountsPage() {
 
   return <main className="workspace-page admin-workspace">
     <header className="site-header staff-brand-header"><BrandLogo href="/staff" className="staff-page-logo" priority /><span className="staff-brand-caption">ADMIN WORKSPACE</span><nav><Link href="/staff/activity">Account activity</Link><Link href="/staff">Workspace</Link></nav></header>
-    <section className="workspace-hero"><p className="eyebrow">ADMINISTRATION</p><h1>Accounts</h1><p>Create, update and deactivate internal or external accounts.</p></section>
+    <section className="workspace-hero"><p className="eyebrow">ADMINISTRATION</p><h1>Accounts</h1><p>Create, update and deactivate internal or external accounts. A Django Superuser can manage Admin accounts; regular Admins can manage employee roles only.</p></section>
     {error && <p className="inline-error" role="alert">{error}</p>}{success && <p className="inline-notice" role="status">{success}</p>}
     <section className="account-toolbar" aria-label="Search and filter accounts">
       <label className="search-field">Search accounts<input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Username, name, email or phone" /></label>
-      <label>Role<select value={roleFilter} onChange={(event) => setRoleFilter(event.target.value)}><option value="">All roles</option>{Object.entries(roleLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+      <label>Role<select value={roleFilter} onChange={(event) => setRoleFilter(event.target.value)}><option value="">All roles</option>{Object.entries(roleLabels).map(([value, label]) => <option key={value} value={value}>{label}{value === "admin" ? " and Superusers" : ""}</option>)}</select></label>
       <label>Account type<select value={typeFilter} onChange={(event) => setTypeFilter(event.target.value)}><option value="">Internal and external</option><option value="internal">Internal</option><option value="external">External</option></select></label>
       <button className="primary-button" onClick={() => { setEditing(null); setCreating(true); setError(""); setSuccess(""); }}>+ Create account</button>
     </section>
@@ -149,10 +155,10 @@ export default function AccountsPage() {
         <label>Email<input name="email" type="email" required defaultValue={editing?.email ?? ""} /></label>
         <label>Phone<input name="phone" type="tel" maxLength={32} defaultValue={editing?.phone ?? ""} /></label>
         {editing ? <label>Account type<select name="account_type" required defaultValue={editing.account_type}><option value="internal">Internal</option><option value="external">External</option></select></label> : <label>Account type<input value="Internal" disabled /><span className="field-note">New accounts use internal SSP roles only.</span></label>}
-        {editing?.role === "admin" ? <label>Role<input value="Admin" disabled /><span className="field-note">Admin role cannot be assigned from this form.</span></label> : <label>Role<select name="role" required defaultValue={editing?.role ?? ""}><option value="" disabled>Select a role</option>{roles.map((role) => <option key={role.value} value={role.value}>{role.label}</option>)}</select></label>}
+        {editing?.is_superuser || (editing?.role === "admin" && !currentUser.is_superuser) ? <label>Role<input value={editing.is_superuser ? "Superuser" : "Admin"} disabled /><span className="field-note">Privileged role changes are protected.</span></label> : <label>Role<select name="role" required defaultValue={editing?.role ?? ""}><option value="" disabled>Select a role</option>{roles.map((role) => <option key={role.value} value={role.value}>{role.label}</option>)}{currentUser.is_superuser && <option value="admin">Admin</option>}</select></label>}
         {!editing && <p className="field-note account-wide">A secure invitation email will provide the password setup link.</p>}
       </div>
-      <p className="account-security-note">New accounts receive a single-use setup link by email. Passwords are never entered or displayed here. This form does not create Admin or superuser accounts.</p>
+      <p className="account-security-note">New accounts receive a single-use setup link by email. Passwords are never entered or displayed here. Website-created Admin accounts are regular Admins; Django superusers are created only through the secured server procedure.</p>
       <button className="primary-button" disabled={busy}>{busy ? "Saving…" : editing ? "Save account" : "Create account and send invitation"}</button>
     </form> : null}
     {listError && <div className="inline-error" role="alert">Unable to refresh account list: {listError} <button className="text-button" onClick={() => void loadAccounts()}>Retry</button></div>}
@@ -162,14 +168,14 @@ export default function AccountsPage() {
         <tbody>{filtered.map((account) => <tr key={account.id}>
           <td data-label="User"><strong>@{account.username}</strong><small>{account.email || "No email"}</small></td>
           <td data-label="Name">{account.first_name || account.last_name ? `${account.first_name} ${account.last_name}`.trim() : "—"}<small>{account.phone || "No phone"}</small></td>
-          <td data-label="Role">{roleLabels[account.role] ?? account.role}</td>
+          <td data-label="Role">{account.is_superuser ? "Superuser" : roleLabels[account.role] ?? account.role}</td>
           <td data-label="Classification">{account.account_type}</td>
           <td data-label="Status"><span className={`account-status ${account.is_active ? "is-active" : "is-inactive"}`}>{account.is_active ? "Active" : "Inactive"}</span></td>
-          <td data-label="Actions"><div className="account-actions">{(account.role !== "admin" || account.id === currentUser.id) && <>
+          <td data-label="Actions"><div className="account-actions">{(!account.is_superuser || account.id === currentUser.id) && (account.role !== "admin" || currentUser.is_superuser || account.id === currentUser.id) && <>
             <button className="quiet-button" disabled={busy} onClick={() => { setEditing(account); setCreating(false); setError(""); setSuccess(""); }}>Edit</button>
-            {account.role !== "admin" && account.is_active && <button className="quiet-button" disabled={busy} onClick={() => void sendAccessLink(account, "password_reset")}>Send password reset</button>}
-            {account.role !== "admin" && !account.is_active && !account.is_onboarded && <button className="quiet-button" disabled={busy} onClick={() => void sendAccessLink(account, "invitation")}>Resend invitation</button>}
-            {account.id !== currentUser.id && account.role !== "admin" && (account.is_active || account.is_onboarded) && <button className={account.is_active ? "danger-button" : "quiet-button"} disabled={busy} onClick={() => void setAccountActive(account, !account.is_active)}>{account.is_active ? "Deactivate" : "Activate"}</button>}
+            {!account.is_superuser && (account.role !== "admin" || currentUser.is_superuser) && account.id !== currentUser.id && account.is_active && <button className="quiet-button" disabled={busy} onClick={() => void sendAccessLink(account, "password_reset")}>Send password reset</button>}
+            {!account.is_superuser && (account.role !== "admin" || currentUser.is_superuser) && account.id !== currentUser.id && !account.is_active && !account.is_onboarded && <button className="quiet-button" disabled={busy} onClick={() => void sendAccessLink(account, "invitation")}>Resend invitation</button>}
+            {!account.is_superuser && account.id !== currentUser.id && (account.role !== "admin" || currentUser.is_superuser) && (account.is_active || account.is_onboarded) && <button className={account.is_active ? "danger-button" : "quiet-button"} disabled={busy} onClick={() => void setAccountActive(account, !account.is_active)}>{account.is_active ? "Deactivate" : "Activate"}</button>}
           </>}</div></td>
         </tr>)}</tbody>
       </table>}

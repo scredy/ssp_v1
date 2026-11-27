@@ -98,8 +98,73 @@ test('Admin onboarding, invitations, password setup/reset, and audit', async ({ 
       await page.goto('/staff/accounts');
       await expect(page.getByRole('heading', { name: 'Accounts' })).toBeVisible();
       await expect(page.getByRole('button', { name: '+ Create account' })).toBeVisible();
+      await expect(page.locator('.role-chip')).toContainText('Superuser');
       return 'Accounts workspace loaded with Create account control.';
     });
+
+    const regularAdminProfile = {
+      username: 'pw_regular_admin', email: 'regular-admin.acceptance@example.com',
+      first_name: 'Nimali', last_name: 'Perera', phone: '+94 77 555 0106',
+    };
+    const adminMailBefore = new Set(listEmails());
+    await step(page, 'Superuser', 'Create a regular Admin account', 'Superuser role selector can issue an Admin invitation without granting Django superuser privileges', async () => {
+      await page.getByRole('button', { name: '+ Create account' }).click();
+      const form = page.locator('form.account-form');
+      await form.getByLabel('Username').fill(regularAdminProfile.username);
+      await form.getByLabel('First name').fill(regularAdminProfile.first_name);
+      await form.getByLabel('Last name').fill(regularAdminProfile.last_name);
+      await form.getByLabel('Email').fill(regularAdminProfile.email);
+      await form.getByLabel('Phone').fill(regularAdminProfile.phone);
+      await expect(form.locator('select[name="role"] option[value="admin"]')).toHaveCount(1);
+      await form.locator('select[name="role"]').selectOption('admin');
+      await form.getByRole('button', { name: 'Create account and send invitation' }).click();
+      await expect(page.locator('.inline-notice')).toContainText('pw_regular_admin');
+      await expect(page.getByRole('row').filter({ hasText: regularAdminProfile.email }).getByText('Admin', { exact: true })).toBeVisible();
+      return 'Superuser created an invited, regular Admin account.';
+    });
+
+    await expect.poll(() => listEmails().find((file) => !adminMailBefore.has(file)), { timeout: 8000 }).toBeTruthy();
+    const regularAdminMail = listEmails().find((file) => !adminMailBefore.has(file));
+    const regularAdminCredentials = { ...regularAdminProfile, password: newPassword('regular-admin') };
+    const regularAdminContext = await browser.newContext({ baseURL });
+    await startTrace(regularAdminContext);
+    const regularAdminPage = await regularAdminContext.newPage();
+    attachPageDiagnostics(regularAdminPage);
+    try {
+      await step(regularAdminPage, 'Admin', 'Accept Admin invitation and inspect permissions', 'Regular Admin sees Admin classification without superuser controls', async () => {
+        await regularAdminPage.goto(invitationLink(regularAdminMail));
+        await regularAdminPage.getByLabel('New password').fill(regularAdminCredentials.password);
+        await regularAdminPage.getByLabel('Confirm password').fill(regularAdminCredentials.password);
+        await regularAdminPage.getByRole('button', { name: 'Set password securely' }).click();
+        await regularAdminPage.waitForURL('**/staff/login?setup=complete');
+        await login(regularAdminPage, 'Admin', regularAdminCredentials);
+        await regularAdminPage.goto('/staff/accounts');
+        await regularAdminPage.getByRole('button', { name: '+ Create account' }).click();
+        const roleSelect = regularAdminPage.locator('form.account-form select[name="role"]');
+        await expect(roleSelect).toHaveCount(1);
+        await expect(roleSelect.locator('option[value="admin"]')).toHaveCount(0);
+        const superuserRow = regularAdminPage.getByRole('row').filter({ hasText: config.SSP_TEST_ADMIN_USERNAME });
+        await expect(superuserRow.getByText('Superuser', { exact: true })).toBeVisible();
+        await expect(superuserRow.getByRole('button')).toHaveCount(0);
+        const result = await regularAdminPage.evaluate(async () => {
+          const csrf = decodeURIComponent(document.cookie.split('; ').find((entry) => entry.startsWith('csrftoken='))?.split('=').slice(1).join('=') ?? '');
+          const accounts = await fetch('/api/accounts/', { credentials: 'include' }).then((response) => response.json());
+          const superuser = accounts.find((account) => account.is_superuser);
+          const response = await fetch(`/api/accounts/${superuser.id}/access-link/`, {
+            method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrf },
+            body: JSON.stringify({ kind: 'password_reset' }),
+          });
+          return response.status;
+        });
+        expect(result).toBe(403);
+        return 'Regular Admin is identified correctly, sees no superuser actions, and cannot issue a superuser reset link.';
+      });
+      state.regularAdmin = regularAdminCredentials;
+      writeState(state);
+    } finally {
+      await regularAdminContext.tracing.stop({ path: testInfoOutput(info, 'regular-admin-trace.zip') });
+      await regularAdminContext.close();
+    }
 
     for (const role of ['staff', 'manager', 'ceo', 'rep']) {
       const label = { staff: 'Staff', manager: 'MD/Manager', ceo: 'CEO', rep: 'Rep' }[role];

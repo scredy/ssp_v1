@@ -8,7 +8,7 @@ from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 
-from .models import User, Vehicle
+from .models import AuditEvent, User, Vehicle
 from config.settings import _get_allowed_hosts
 
 
@@ -137,9 +137,76 @@ class AccountApiTests(APITestCase):
         payload = {"username": "another-admin", "email": "a@example.test", "role": "admin",
                    "account_type": "internal"}
         response = self.client.post("/api/accounts/", payload, format="json")
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
         response = self.client.patch(f"/api/accounts/{staff.pk}/", {"role": "admin"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def make_superuser(self, username="root"):
+        user = self.make_user(username, User.Role.ADMIN)
+        user.is_superuser = True
+        user.is_staff = True
+        user.save(update_fields=["is_superuser", "is_staff"])
+        return user
+
+    def test_superuser_can_create_regular_admin_but_not_superuser(self):
+        superuser = self.make_superuser()
+        self.login_as(superuser)
+        with patch("accounts.views.send_mail", return_value=1):
+            response = self.client.post("/api/accounts/", {
+                "username": "regular-admin", "email": "regular-admin@example.test",
+                "role": "admin", "account_type": "internal",
+            }, format="json")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        account = User.objects.get(pk=response.data["id"])
+        self.assertEqual(account.role, User.Role.ADMIN)
+        self.assertFalse(account.is_superuser)
+        self.assertFalse(account.is_staff)
+        self.assertFalse(account.is_active)
+        self.assertFalse(account.has_usable_password())
+        self.assertFalse(response.data["is_superuser"])
+
+    def test_superuser_can_promote_and_demote_employee_with_audit(self):
+        superuser = self.make_superuser()
+        staff = self.make_user("promote-staff", User.Role.STAFF)
+        self.login_as(superuser)
+        response = self.client.patch(f"/api/accounts/{staff.pk}/", {"role": "admin"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["role"], "admin")
+        self.assertFalse(response.data["is_superuser"])
+        staff.refresh_from_db()
+        self.assertFalse(staff.is_staff)
+        self.assertFalse(staff.is_superuser)
+        self.assertTrue(AuditEvent.objects.filter(action="account.role_changed", subject=staff.username,
+            details__role_from="staff", details__role_to="admin").exists())
+        response = self.client.patch(f"/api/accounts/{staff.pk}/", {"role": "staff"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(AuditEvent.objects.filter(action="account.role_changed", subject=staff.username,
+            details__role_from="admin", details__role_to="staff").exists())
+
+    def test_regular_admin_cannot_modify_admins_or_privilege_fields(self):
+        admin = self.make_user("regular-root", User.Role.ADMIN)
+        another_admin = self.make_user("another-root", User.Role.ADMIN)
+        staff = self.make_user("ordinary-staff", User.Role.STAFF)
+        self.login_as(admin)
+        self.assertEqual(self.client.patch(f"/api/accounts/{another_admin.pk}/", {"email": "changed@example.test"}, format="json").status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(self.client.patch(f"/api/accounts/{another_admin.pk}/", {"is_active": False}, format="json").status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(self.client.post(f"/api/accounts/{another_admin.pk}/access-link/", {"kind": "password_reset"}, format="json").status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(self.client.patch(f"/api/accounts/{staff.pk}/", {"role": "admin"}, format="json").status_code, status.HTTP_403_FORBIDDEN)
+        for field in ("is_superuser", "is_staff", "groups", "user_permissions"):
+            response = self.client.patch(f"/api/accounts/{staff.pk}/", {field: True}, format="json")
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, field)
+
+    def test_superuser_privilege_flags_and_last_active_account_are_protected(self):
+        superuser = self.make_superuser()
+        self.login_as(superuser)
+        response = self.client.patch(f"/api/accounts/{superuser.pk}/", {"is_active": False}, format="json")
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        response = self.client.patch(f"/api/accounts/{superuser.pk}/", {"role": "staff"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        response = self.client.patch(f"/api/accounts/{superuser.pk}/", {"is_superuser": False}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        response = self.client.get("/api/auth/me/")
+        self.assertTrue(response.data["is_superuser"])
 
     def test_admin_account_is_protected_from_other_admins(self):
         admin = self.make_user("root", User.Role.ADMIN)
