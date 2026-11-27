@@ -117,6 +117,102 @@ class PaymentApiTests(APITestCase):
         self.assertEqual(Decimal(sale_summary.data["verified_received_lkr"]), Decimal("125.50"))
         self.assertEqual(Payment.objects.filter(import_order=order).count(), 2)
 
+    def test_import_agreed_price_and_remaining_payment_workflow(self):
+        created = self.make_import()
+        order = ImportOrder.objects.get(reference=created.data["reference"])
+        url = f"/api/staff/imports/{order.reference}/payments/summary/"
+
+        advance = self.import_payment(order.reference)
+        self.assertEqual(advance.status_code, status.HTTP_201_CREATED)
+
+        payload = {"agreed_price_lkr": "1000.00", "reason": "Customer agreement"}
+        for denied in (self.staff, self.rep, self.admin):
+            self.client.force_authenticate(denied)
+            self.assertEqual(
+                self.client.patch(url, payload, format="json").status_code,
+                status.HTTP_403_FORBIDDEN,
+            )
+
+        self.client.force_authenticate(self.ceo)
+        too_low = self.client.patch(url, {
+            **payload, "agreed_price_lkr": "100.00"
+        }, format="json")
+        self.assertEqual(too_low.status_code, status.HTTP_400_BAD_REQUEST)
+
+        saved = self.client.patch(url, payload, format="json")
+        self.assertEqual(saved.status_code, status.HTTP_200_OK)
+        self.assertEqual(Decimal(saved.data["agreed_price_lkr"]), Decimal("1000.00"))
+        self.assertEqual(Decimal(saved.data["outstanding_balance_lkr"]), Decimal("874.50"))
+        self.assertTrue(AuditEvent.objects.filter(
+            action="import.agreed_price.updated", subject=order.reference
+        ).exists())
+
+        overpayment = self.record_payment(self.manager, {
+            "import_reference": order.reference,
+            "amount_lkr": "875.00",
+            "method": "cash",
+        })
+        self.assertEqual(overpayment.status_code, status.HTTP_409_CONFLICT)
+
+        pending = Payment.objects.create(
+            import_order=order, amount_lkr=Decimal("875.00"),
+            method=Payment.Method.CASH, recorded_by=self.staff,
+            status=Payment.Status.PENDING,
+        )
+        self.client.force_authenticate(self.ceo)
+        result = self.client.post(
+            f"/api/staff/payments/{pending.reference}/verify/", {}, format="json"
+        )
+        self.assertEqual(result.status_code, status.HTTP_409_CONFLICT)
+
+        partial = self.record_payment(self.manager, {
+            "import_reference": order.reference,
+            "amount_lkr": "374.50",
+            "method": "cash",
+        })
+        self.assertEqual(partial.status_code, status.HTTP_201_CREATED)
+
+        vehicle = self.make_vehicle("import-price")
+        order.refresh_from_db()
+        order.vehicle = vehicle
+        order.status = ImportOrder.Status.READY_FOR_COLLECTION
+        order.save(update_fields=["vehicle", "status"])
+
+        sale_payload = {
+            "sale_type": "import",
+            "import_reference": order.reference,
+            "agreed_price_lkr": "1100.00",
+            "sale_date": "2026-11-28",
+        }
+        mismatch = self.client.post("/api/manager/sales/", sale_payload, format="json")
+        self.assertEqual(mismatch.status_code, status.HTTP_400_BAD_REQUEST)
+
+        sale_payload["agreed_price_lkr"] = "1000.00"
+        linked = self.client.post("/api/manager/sales/", sale_payload, format="json")
+        self.assertEqual(linked.status_code, status.HTTP_201_CREATED, linked.data)
+
+        locked = self.client.patch(url, {
+            **payload, "agreed_price_lkr": "1200.00"
+        }, format="json")
+        self.assertEqual(locked.status_code, status.HTTP_409_CONFLICT)
+
+        final = self.record_payment(self.ceo, {
+            "import_reference": order.reference,
+            "amount_lkr": "500.00",
+            "method": "cash",
+        })
+        self.assertEqual(final.status_code, status.HTTP_201_CREATED)
+
+        import_summary = self.client.get(url)
+        sale_summary = self.client.get(
+            f"/api/manager/sales/{linked.data['reference']}/payments/summary/"
+        )
+        self.assertEqual(import_summary.data["linked_sale_reference"], linked.data["reference"])
+        self.assertEqual(Decimal(import_summary.data["verified_amount_lkr"]), Decimal("1000.00"))
+        self.assertEqual(Decimal(import_summary.data["outstanding_balance_lkr"]), Decimal("0.00"))
+        self.assertEqual(Decimal(sale_summary.data["outstanding_balance_lkr"]), Decimal("0.00"))
+        self.assertEqual(Decimal(sale_summary.data["verified_received_lkr"]), Decimal("1000.00"))
+
     def test_payment_creation_is_confirmed_immediately_and_reduces_balance(self):
         response = self.record_payment()
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)

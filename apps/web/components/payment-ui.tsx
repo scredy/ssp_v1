@@ -16,9 +16,10 @@ export type PaymentRecord = {
 type PaymentSummary = {
   sale_reference?: string; reservation_reference?: string; import_reference?: string; linked_sale_reference?: string | null;
   customer_name?: string; vehicle_name?: string; vehicle_reference?: string | null; vehicle_image_url?: string | null; transaction_date?: string; transaction_type?: string;
-  sale_price_lkr?: string; agreed_price_lkr?: string;
+  sale_price_lkr?: string | null; agreed_price_lkr?: string | null;
+  price_source?: "sale" | "import" | "unset";
   advance_declared_unverified_lkr?: string; verified_received_lkr?: string;
-  pending_verification_lkr?: string; outstanding_balance_lkr?: string;
+  pending_verification_lkr?: string; outstanding_balance_lkr?: string | null;
   verified_amount_lkr?: string; pending_amount_lkr?: string; rejected_amount_lkr?: string;
 };
 const money = (v: string | number) => new Intl.NumberFormat("en-LK", { style: "currency", currency: "LKR", maximumFractionDigits: 2 }).format(Number(v || 0));
@@ -31,6 +32,12 @@ export function PaymentPanel({ kind, reference, linkedReference, canRecord }: { 
   const [payments, setPayments] = useState<PaymentRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [editingPrice, setEditingPrice] = useState(false);
+  const [priceDraft, setPriceDraft] = useState("");
+  const [priceReason, setPriceReason] = useState("");
+  const [priceBusy, setPriceBusy] = useState(false);
+  const [priceError, setPriceError] = useState("");
+  const [priceNotice, setPriceNotice] = useState("");
   const load = useCallback(async () => {
     setLoading(true); setError("");
     try {
@@ -46,14 +53,79 @@ export function PaymentPanel({ kind, reference, linkedReference, canRecord }: { 
     finally { setLoading(false); }
   }, [kind, reference, linkedReference, canRecord]);
   useEffect(() => { void load(); }, [load]);
-  const price = summary?.sale_price_lkr ?? (kind === "import" ? undefined : summary?.agreed_price_lkr ?? (summary ? Number(summary.verified_received_lkr || 0) + Number(summary.outstanding_balance_lkr || 0) : undefined));
-  const verified = kind === "import" ? summary?.verified_amount_lkr : summary?.verified_received_lkr;
+  const price = summary?.sale_price_lkr ?? summary?.agreed_price_lkr;
+  const verified = summary?.verified_received_lkr ?? summary?.verified_amount_lkr;
   const targetType = kind;
+
+  async function saveImportPrice(event: React.FormEvent) {
+    event.preventDefault();
+    if (!canRecord || kind !== "import" || priceBusy || !priceReason.trim()) return;
+    setPriceBusy(true);
+    setPriceError("");
+    setPriceNotice("");
+    try {
+      await api<PaymentSummary>(
+        `/api/staff/imports/${encodeURIComponent(reference)}/payments/summary/`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({
+            agreed_price_lkr: priceDraft,
+            reason: priceReason.trim(),
+          }),
+        }
+      );
+      setEditingPrice(false);
+      setPriceReason("");
+      setPriceNotice("Agreed import price saved.");
+      await load();
+    } catch (e) {
+      setPriceError(e instanceof Error ? e.message : "Price could not be saved.");
+    } finally {
+      setPriceBusy(false);
+    }
+  }
   return <section className="payment-panel">
     <div className="payment-panel-heading"><div><p className="eyebrow">PAYMENTS</p><h3>Payment summary</h3></div>{canRecord && <Link className="primary-button" href={`/staff/payments?target_type=${targetType}&reference=${encodeURIComponent(reference)}`}>Record payment</Link>}</div>
     {loading ? <p className="public-state">Loading payment summary…</p> : error ? <p className="reservation-feedback is-error" role="alert">{error}</p> : <>
       {summary?.advance_declared_unverified_lkr !== undefined && <p className="payment-declared">Declared reservation advance · not a recorded or verified payment: <strong>{money(summary.advance_declared_unverified_lkr)}</strong></p>}
-      <div className="payment-summary-grid">{price !== undefined && <article><span>Agreed price</span><strong>{money(price)}</strong></article>}<article><span>Confirmed received</span><strong>{money(verified || 0)}</strong></article><article><span>Outstanding balance</span><strong>{money(summary?.outstanding_balance_lkr || 0)}</strong></article></div>
+      <div className="payment-summary-grid"><article><span>Agreed price</span><strong>{price == null ? "Not available" : money(price)}</strong></article><article><span>Confirmed received</span><strong>{verified == null ? "Not available" : money(verified)}</strong></article><article><span>Outstanding balance</span><strong>{summary?.outstanding_balance_lkr == null ? "Not available" : money(summary.outstanding_balance_lkr)}</strong></article></div>
+    {kind === "import" && summary?.price_source === "unset" && (
+      <p className="payment-note">The agreed import price has not been established. Confirmed payments are recorded, but the outstanding balance is not yet known.</p>
+    )}
+    {kind === "import" && canRecord && summary?.price_source && summary.price_source !== "sale" && (
+      <div className="import-action-form">
+        {priceNotice && <p role="status">{priceNotice}</p>}
+        {!editingPrice ? (
+          <button type="button" className="inventory-secondary" onClick={() => {
+            setPriceDraft(String(price ?? ""));
+            setPriceReason("");
+            setPriceError("");
+            setEditingPrice(true);
+          }}>{price == null ? "Set agreed import price" : "Update agreed import price"}</button>
+        ) : (
+          <form onSubmit={saveImportPrice}>
+            <h4>Agreed import price</h4>
+            <label>Total agreed price (LKR)
+              <input required type="number" min="0.01" step="0.01"
+                value={priceDraft} onChange={(event) => setPriceDraft(event.target.value)} />
+            </label>
+            <label>Reason / agreement reference
+              <textarea required maxLength={1000} rows={2}
+                value={priceReason} onChange={(event) => setPriceReason(event.target.value)} />
+            </label>
+            {priceError && <p role="alert" className="reservation-feedback is-error">{priceError}</p>}
+            <button type="submit" className="primary-button" disabled={priceBusy || !priceReason.trim()}>
+              {priceBusy ? "Saving..." : "Save agreed price"}
+            </button>
+            <button type="button" className="inventory-secondary" disabled={priceBusy}
+              onClick={() => setEditingPrice(false)}>Cancel</button>
+          </form>
+        )}
+      </div>
+    )}
+    {kind === "import" && summary?.price_source === "sale" && (
+      <p className="payment-note">The agreed price is now controlled by the linked sale.</p>
+    )}
     {canRecord && <div className="payment-history"><h4>Payment history</h4>{payments.length === 0 ? <p>No recorded payments for this transaction.</p> : <div className="payment-history-list">{payments.map((p) => <article key={p.reference}><div><strong>{p.reference}</strong><span className={`payment-status is-${p.status}`}>{statusTitle(p.status)}</span></div><p>{money(p.amount_lkr)} / {p.method.replaceAll("_", " ")} / {p.payment_date}</p><small>Recorded by {p.recorded_by_name}</small>{p.evidence_attached && p.evidence_url && <a href={`${API}${p.evidence_url}`} target="_blank" rel="noreferrer">Open private evidence</a>}</article>)}</div>}</div>}
     </>}
   </section>;
@@ -187,8 +259,15 @@ export default function StaffPayments() {
       <div className="payment-target-switch" role="group" aria-label="Payment target"><button type="button" className={targetType === "sale" ? "is-active" : ""} onClick={() => { setTargetType("sale"); setFormSummary(null); setFormPayments([]); }}>Sale</button><button type="button" className={targetType === "reservation" ? "is-active" : ""} onClick={() => { setTargetType("reservation"); setFormSummary(null); setFormPayments([]); }}>Reservation</button><button type="button" className={targetType === "import" ? "is-active" : ""} onClick={() => { setTargetType("import"); setFormSummary(null); setFormPayments([]); }}>Import Order</button></div>
       {formSummary && <section className="payment-transaction-card">{formSummary.vehicle_image_url ? <img src={`${API}${formSummary.vehicle_image_url}`} alt={formSummary.vehicle_name || "Vehicle"} onError={(event) => { event.currentTarget.style.display = "none"; }} /> : <div className="payment-vehicle-placeholder" aria-label="No vehicle image available">SSP</div>}<div className="payment-transaction-info"><div><h3>{formSummary.vehicle_name || (targetType === "import" ? "Personal import" : "Vehicle details unavailable")}</h3><span>{targetType === "sale" ? "Sale" : targetType === "reservation" ? "Reservation" : "Import"} reference: {reference}</span></div><dl><div><dt>Customer</dt><dd>{formSummary.customer_name || "—"}</dd></div><div><dt>Date</dt><dd>{formSummary.transaction_date || "—"}</dd></div><div><dt>Type</dt><dd>{formSummary.transaction_type || targetType}</dd></div></dl></div></section>}
       <div className="reservation-form-grid">
-        <label>{targetType === "sale" ? "Sale reference" : targetType === "reservation" ? "Reservation reference" : "Import reference"} *<div className="payment-reference-field"><input required value={reference} onChange={(e) => { setReference(e.target.value); setFormSummary(null); setFormPayments([]); }} onBlur={() => void refreshTargetSummary()} placeholder={targetType === "sale" ? "e.g. SAL-0001" : targetType === "reservation" ? "e.g. RSV-0001" : "e.g. IMP-…"}/>{targetType !== "import" && <button type="button" className="inventory-secondary" disabled={!reference.trim()} onClick={() => void refreshTargetSummary()}>Check balance</button>}</div></label>
-        <label>Payment amount (LKR) *<input required type="number" min="0.01" step="0.01" value={amount} onChange={(e) => setAmount(e.target.value)}/></label>
+        <label>{targetType === "sale" ? "Sale reference" : targetType === "reservation" ? "Reservation reference" : "Import reference"} *<div className="payment-reference-field"><input required value={reference} onChange={(e) => { setReference(e.target.value); setFormSummary(null); setFormPayments([]); }} onBlur={() => void refreshTargetSummary()} placeholder={targetType === "sale" ? "e.g. SAL-0001" : targetType === "reservation" ? "e.g. RSV-0001" : "e.g. IMP-…"}/><button type="button" className="inventory-secondary" disabled={!reference.trim()} onClick={() => void refreshTargetSummary()}>Check balance</button></div></label>
+        <label>Payment amount (LKR) *<input required type="number" min="0.01" step="0.01" value={amount} onChange={(e) => setAmount(e.target.value)}/>
+          {formSummary?.outstanding_balance_lkr != null && pendingAllowance > 0 && (
+            <button type="button" className="inventory-secondary"
+              onClick={() => setAmount(String(formSummary.outstanding_balance_lkr))}>
+              Use outstanding balance
+            </button>
+          )}
+        </label>
         <label>Payment type *<select required value={paymentType} onChange={(e) => setPaymentType(e.target.value)}><option value="advance">Advance</option><option value="partial">Partial payment</option><option value="final">Final payment</option><option value="finance_settlement">Finance settlement</option></select></label>
         <label>Payment method *<select required value={paymentMethod} onChange={(e) => { setPaymentMethod(e.target.value); setFundsCleared(e.target.value === "cash"); }}><option value="cash">Cash</option><option value="bank_transfer">Bank transfer</option><option value="cheque">Cheque</option><option value="other">Other</option></select></label>
         {paymentMethod !== "cash" && <label className="payment-clearance"><input type="checkbox" checked={fundsCleared} onChange={(e) => setFundsCleared(e.target.checked)} />I confirm these funds have been received and cleared *</label>}<label>Payment date *<input required type="date" value={paymentDate} onChange={(e) => setPaymentDate(e.target.value)}/></label>
@@ -197,13 +276,13 @@ export default function StaffPayments() {
         <label className="reservation-wide">Staff notes<textarea rows={3} maxLength={3000} value={notes} onChange={(e) => setNotes(e.target.value)}/></label>
         {summaryError && <p className="reservation-wide reservation-feedback is-error" role="alert">{summaryError}</p>}
         {formSummary?.outstanding_balance_lkr != null && Number(amount) > Math.max(0, pendingAllowance) && Number(amount) > 0 && <p className="reservation-wide payment-field-error">Amount exceeds the current outstanding balance.</p>}
-      </div><aside className="payment-settlement-preview"><h3>Settlement Summary</h3>{formSummary ? <><div><span>Total payable</span><strong>{(formSummary.sale_price_lkr ?? formSummary.agreed_price_lkr) == null ? "—" : money(formSummary.sale_price_lkr ?? formSummary.agreed_price_lkr ?? 0)}</strong></div><div><span>Confirmed payments</span><strong>{money(formSummary.verified_received_lkr || formSummary.verified_amount_lkr || 0)}</strong></div><div className="is-outstanding"><span>Outstanding balance</span><strong>{money(formSummary.outstanding_balance_lkr || 0)}</strong></div><div><span>Projected after payment</span><strong>{formSummary.outstanding_balance_lkr == null ? "—" : money(Math.max(0, pendingAllowance - Number(amount || 0)))}</strong></div><div className="payment-progress"><span style={{ width: `${Math.min(100, Number((formSummary.sale_price_lkr ?? formSummary.agreed_price_lkr) ? (Number(formSummary.verified_received_lkr || 0) / Number(formSummary.sale_price_lkr ?? formSummary.agreed_price_lkr)) * 100 : 0))}%` }} /></div><div className="payment-history"><h4>Previous Payments</h4>{formPayments.length ? <div className="payment-history-list">{formPayments.slice(0, 4).map((payment) => <article key={payment.reference}><div><strong>{payment.payment_date}</strong><span className={`payment-status is-${payment.status}`}>{statusTitle(payment.status)}</span></div><p>{paymentTypeTitle(payment.payment_type)} · {money(payment.amount_lkr)}</p><small>{payment.method.replaceAll("_", " ")}{payment.transaction_reference ? ` · ${payment.transaction_reference}` : ""}</small></article>)}</div> : <p>No previous payments for this transaction.</p>}</div></> : <p>Enter a sale, reservation or import reference to load the current settlement.</p>}</aside><p className="payment-note">The payment is confirmed immediately when recorded. The balance preview updates after the server accepts the transaction.</p>
+      </div><aside className="payment-settlement-preview"><h3>Settlement Summary</h3>{formSummary ? <><div><span>Total payable</span><strong>{(formSummary.sale_price_lkr ?? formSummary.agreed_price_lkr) == null ? "—" : money(formSummary.sale_price_lkr ?? formSummary.agreed_price_lkr ?? 0)}</strong></div><div><span>Confirmed payments</span><strong>{money(formSummary.verified_received_lkr || formSummary.verified_amount_lkr || 0)}</strong></div><div className="is-outstanding"><span>Outstanding balance</span><strong>{formSummary.outstanding_balance_lkr == null ? "Not available" : money(formSummary.outstanding_balance_lkr)}</strong></div><div><span>Projected after payment</span><strong>{formSummary.outstanding_balance_lkr == null ? "—" : money(Math.max(0, pendingAllowance - Number(amount || 0)))}</strong></div><div className="payment-progress"><span style={{ width: `${Math.min(100, Number((formSummary.sale_price_lkr ?? formSummary.agreed_price_lkr) ? (Number(formSummary.verified_received_lkr ?? formSummary.verified_amount_lkr ?? 0) / Number(formSummary.sale_price_lkr ?? formSummary.agreed_price_lkr)) * 100 : 0))}%` }} /></div><div className="payment-history"><h4>Previous Payments</h4>{formPayments.length ? <div className="payment-history-list">{formPayments.slice(0, 4).map((payment) => <article key={payment.reference}><div><strong>{payment.payment_date}</strong><span className={`payment-status is-${payment.status}`}>{statusTitle(payment.status)}</span></div><p>{paymentTypeTitle(payment.payment_type)} · {money(payment.amount_lkr)}</p><small>{payment.method.replaceAll("_", " ")}{payment.transaction_reference ? ` · ${payment.transaction_reference}` : ""}</small></article>)}</div> : <p>No previous payments for this transaction.</p>}</div></> : <p>Enter a sale, reservation or import reference to load the current settlement.</p>}</aside><p className="payment-note">The payment is confirmed immediately when recorded. The balance preview updates after the server accepts the transaction.</p>
       <button className="primary-button" disabled={busy || amountInvalid || !reference.trim()}>{busy ? "Recording…" : "Confirm & Record Payment"}</button>
     </form>}
     {confirmSubmit && <div className="reservation-dialog-backdrop" role="presentation"><section className="reservation-dialog" role="dialog" aria-modal="true" aria-labelledby="payment-confirm-title"><p className="eyebrow">CONFIRM TRANSACTION</p><h2 id="payment-confirm-title">Confirm & Record Payment?</h2><p>This records the LKR {amount} payment as confirmed immediately and updates the outstanding balance.</p><dl><div><dt>Transaction</dt><dd>{reference}</dd></div><div><dt>Payment method</dt><dd>{paymentMethod.replaceAll("_", " ")}</dd></div><div><dt>Projected outstanding</dt><dd>{formSummary?.outstanding_balance_lkr == null ? "—" : money(Math.max(0, pendingAllowance - Number(amount || 0)))}</dd></div></dl><footer><button type="button" className="inventory-secondary" disabled={busy} onClick={() => setConfirmSubmit(false)}>Cancel</button><button type="button" className="primary-button" disabled={busy} onClick={() => void confirmRecord()}>{busy ? "Recording…" : "Confirm & Record Payment"}</button></footer></section></div>}
     <div className="payments-filters"><label>Search<input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Payment, sale, reservation, import or customer"/></label><label>Status<select value={status} onChange={(e) => setStatus(e.target.value)}><option value="">All statuses</option><option value="pending">Legacy pending</option><option value="verified">Verified</option><option value="rejected">Rejected</option></select></label><label>Method<select value={method} onChange={(e) => setMethod(e.target.value)}><option value="">All methods</option><option value="cash">Cash</option><option value="bank_transfer">Bank transfer</option><option value="cheque">Cheque</option><option value="other">Other</option></select></label><label>From<input type="date" value={fromDate} onChange={(e) => setFromDate(e.target.value)}/></label><label>To<input type="date" value={toDate} onChange={(e) => setToDate(e.target.value)}/></label><span>{rows.length} records · latest 250</span></div>
     <section className="payment-directory-layout"><div className="reservation-table-wrap payment-table-wrap">{loading ? <p className="public-state">Loading payments…</p> : error ? <div className="reservation-feedback is-error" role="alert"><p>{error}</p><button type="button" className="inventory-secondary" onClick={() => void load()}>Retry</button></div> : rows.length === 0 ? <div className="reservation-empty"><h2>No payments found</h2><p>{search || status || method || fromDate || toDate ? "Try adjusting your filters." : "Recorded payment transactions will appear here."}</p></div> : <table className="reservation-table payment-table"><thead><tr><th>Payment reference</th><th>Sale / reservation / import</th><th>Customer</th><th>Type</th><th>Amount</th><th>Method</th><th>Date</th><th>Status</th></tr></thead><tbody>{rows.map((p) => <tr key={p.reference} className={selected?.reference === p.reference ? "is-selected" : ""} onClick={() => setSelected(p)} tabIndex={0} onKeyDown={(e) => e.key === "Enter" && setSelected(p)}><td><strong>{p.reference}</strong></td><td>{p.sale_reference || p.reservation_reference || p.import_reference || "—"}</td><td>{p.customer_name || "—"}</td><td>{paymentTypeTitle(p.payment_type)}</td><td>{money(p.amount_lkr)}</td><td>{p.method.replaceAll("_", " ")}</td><td>{p.payment_date}</td><td><span className={`payment-status is-${p.status}`}>{statusTitle(p.status)}</span></td></tr>)}</tbody></table>}</div>
-    {selected && <aside className="reservation-detail payment-detail" aria-label="Payment details"><div className="reservation-detail-heading"><div><p className="eyebrow">PAYMENT DETAIL</p><h2>{selected.reference}</h2></div><button className="inventory-secondary" onClick={() => setSelected(null)} aria-label="Close payment details">×</button></div><span className={`payment-status is-${selected.status}`}>{statusTitle(selected.status)}</span><dl><div><dt>Amount</dt><dd>{money(selected.amount_lkr)}</dd></div><div><dt>Payment type</dt><dd>{paymentTypeTitle(selected.payment_type)}</dd></div><div><dt>Sale / reservation / import</dt><dd>{selected.sale_reference || selected.reservation_reference || "—"}</dd></div><div><dt>Customer</dt><dd>{selected.customer_name || "—"}</dd></div><div><dt>Method</dt><dd>{selected.method.replaceAll("_", " ")}</dd></div><div><dt>Transaction reference</dt><dd>{selected.transaction_reference || "—"}</dd></div><div><dt>Payment date</dt><dd>{selected.payment_date}</dd></div><div><dt>Recorded by</dt><dd>{selected.recorded_by_name}<small>{slTime(selected.created_at)}</small></dd></div>{selected.verified_at && <div><dt>Verified by</dt><dd>{selected.verified_by_name || "—"}<small>{slTime(selected.verified_at)}</small></dd></div>}{selected.rejected_at && <div><dt>Rejected by</dt><dd>{selected.rejected_by_name || "—"}<small>{slTime(selected.rejected_at)}</small></dd></div>}</dl>{selected.notes && <section><h4>Staff notes</h4><p>{selected.notes}</p></section>}{selected.rejection_reason && <section><h4>Rejection reason</h4><p>{selected.rejection_reason}</p></section>}{selected.evidence_attached && selected.evidence_url ? <a className="inventory-secondary" href={`${API}${selected.evidence_url}`} target="_blank" rel="noreferrer">Review private evidence</a> : <p className="payment-note">No evidence attached.</p>}
+    {selected && <aside className="reservation-detail payment-detail" aria-label="Payment details"><div className="reservation-detail-heading"><div><p className="eyebrow">PAYMENT DETAIL</p><h2>{selected.reference}</h2></div><button className="inventory-secondary" onClick={() => setSelected(null)} aria-label="Close payment details">×</button></div><span className={`payment-status is-${selected.status}`}>{statusTitle(selected.status)}</span><dl><div><dt>Amount</dt><dd>{money(selected.amount_lkr)}</dd></div><div><dt>Payment type</dt><dd>{paymentTypeTitle(selected.payment_type)}</dd></div><div><dt>Sale / reservation / import</dt><dd>{selected.sale_reference || selected.reservation_reference || selected.import_reference || "—"}</dd></div><div><dt>Customer</dt><dd>{selected.customer_name || "—"}</dd></div><div><dt>Method</dt><dd>{selected.method.replaceAll("_", " ")}</dd></div><div><dt>Transaction reference</dt><dd>{selected.transaction_reference || "—"}</dd></div><div><dt>Payment date</dt><dd>{selected.payment_date}</dd></div><div><dt>Recorded by</dt><dd>{selected.recorded_by_name}<small>{slTime(selected.created_at)}</small></dd></div>{selected.verified_at && <div><dt>Verified by</dt><dd>{selected.verified_by_name || "—"}<small>{slTime(selected.verified_at)}</small></dd></div>}{selected.rejected_at && <div><dt>Rejected by</dt><dd>{selected.rejected_by_name || "—"}<small>{slTime(selected.rejected_at)}</small></dd></div>}</dl>{selected.notes && <section><h4>Staff notes</h4><p>{selected.notes}</p></section>}{selected.rejection_reason && <section><h4>Rejection reason</h4><p>{selected.rejection_reason}</p></section>}{selected.evidence_attached && selected.evidence_url ? <a className="inventory-secondary" href={`${API}${selected.evidence_url}`} target="_blank" rel="noreferrer">Review private evidence</a> : <p className="payment-note">No evidence attached.</p>}
       {canReview && selected.status === "pending" && <div className="payment-review-actions">{selected.recorded_by_name === user?.username ? <p className="payment-note">You cannot verify a payment you recorded.</p> : <button className="primary-button" disabled={busy} onClick={() => { if (window.confirm(`Verify ${selected.reference} for ${money(selected.amount_lkr)}?`)) void review("verify"); }}>Verify payment</button>}<label>Rejection reason *<textarea rows={3} maxLength={1000} value={rejectReason} onChange={(e) => setRejectReason(e.target.value)}/></label><button className="inventory-danger" disabled={busy || !rejectReason.trim()} onClick={() => void review("reject")}>{busy ? "Saving…" : "Reject payment"}</button></div>}
       {canRecord && selected.status === "verified" && <div className="payment-review-actions"><p className="payment-note">Reversal records an audit entry and recalculates the settlement balance. It does not undo a completed handover or commission payout.</p><label>Reversal reason *<textarea rows={3} maxLength={1000} value={reverseReason} onChange={(e) => setReverseReason(e.target.value)} /></label><button className="inventory-danger" disabled={busy || !reverseReason.trim()} onClick={() => { if (window.confirm(`Reverse ${selected.reference}?`)) void reversePayment(); }}>Reverse confirmed payment</button></div>}
     </aside>}</section>

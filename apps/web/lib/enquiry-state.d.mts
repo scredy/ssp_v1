@@ -2,3 +2,6 @@ export function syncSavedEnquiry<T extends { id: number; internal_notes: string;
   items: T[],
   saved: T,
 ): { selected: T; items: T[]; note: string; scheduledAt: string | null };
+
+export function supportsScheduling(kind: string): boolean;
+export function enquiryStatuses(kind: string): string[];

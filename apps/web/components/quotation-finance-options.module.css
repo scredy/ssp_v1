@@ -1,0 +1,59 @@
+.options:global(.quotation-finance-options) {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 14rem), 1fr));
+  gap: 0.75rem;
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+.options:global(.quotation-finance-options) > label {
+  display: grid;
+  grid-template-columns: 1.125rem minmax(0, 1fr);
+  align-items: start;
+  gap: 0.65rem;
+  min-width: 0;
+  padding: 0.75rem;
+  border: 1px solid #dce2e5;
+  border-radius: 0.45rem;
+  background: #fff;
+  cursor: pointer;
+}
+
+.options:global(.quotation-finance-options) > label:first-of-type {
+  grid-column: 1 / -1;
+  background: #f5f6f7;
+}
+
+.options:global(.quotation-finance-options) > label > input[type="checkbox"] {
+  appearance: auto;
+  display: block;
+  width: 1rem;
+  height: 1rem;
+  min-width: 1rem;
+  min-height: 0;
+  margin: 0.15rem 0 0;
+  padding: 0;
+  accent-color: #c72d37;
+  cursor: pointer;
+}
+
+.options > label > span {
+  display: grid;
+  gap: 0.3rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  line-height: 1.45;
+}
+
+.options > label strong {
+  font-size: 0.85rem;
+}
+
+.options > label small {
+  display: block;
+  color: #626a70;
+  font-size: 0.75rem;
+  line-height: 1.45;
+  white-space: normal;
+}

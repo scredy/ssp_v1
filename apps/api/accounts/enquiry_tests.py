@@ -13,6 +13,47 @@ from .models import AuditEvent, Customer, Enquiry, User, Vehicle
 
 
 class EnquiryApiTests(APITestCase):
+    def test_non_appointment_enquiries_reject_scheduling_fields(self):
+        from datetime import timedelta
+        from django.utils import timezone
+        from .models import Enquiry
+        from .serializers import StaffEnquirySerializer
+
+        future = timezone.now() + timedelta(days=2)
+
+        for kind in (Enquiry.Kind.GENERAL, Enquiry.Kind.QUOTE):
+            enquiry = Enquiry(kind=kind, status=Enquiry.Status.NEW)
+
+            invalid = StaffEnquirySerializer(
+                enquiry,
+                data={"status": "scheduled", "scheduled_at": future},
+                partial=True,
+            )
+            self.assertFalse(invalid.is_valid())
+
+            invalid_date = StaffEnquirySerializer(
+                enquiry,
+                data={"status": "contacted", "scheduled_at": future},
+                partial=True,
+            )
+            self.assertFalse(invalid_date.is_valid())
+
+            valid = StaffEnquirySerializer(
+                enquiry,
+                data={"status": "contacted", "internal_notes": "Called customer"},
+                partial=True,
+            )
+            self.assertTrue(valid.is_valid(), valid.errors)
+
+        for kind in (Enquiry.Kind.APPOINTMENT, Enquiry.Kind.TEST_DRIVE):
+            enquiry = Enquiry(kind=kind, status=Enquiry.Status.NEW)
+            valid = StaffEnquirySerializer(
+                enquiry,
+                data={"status": "scheduled", "scheduled_at": future},
+                partial=True,
+            )
+            self.assertTrue(valid.is_valid(), valid.errors)
+
     def setUp(self):
         cache.clear()
 

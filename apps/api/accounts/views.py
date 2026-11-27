@@ -111,6 +111,16 @@ def notify_active_roles(roles, event_key, title, message, target_url, exclude_us
     create_notifications(recipients, event_key, title, message, target_url)
 
 
+def notify_account_event(event, title, message):
+    notify_active_roles(
+        (User.Role.ADMIN,),
+        f"system:account:{event.pk}",
+        title,
+        message,
+        "/staff/accounts",
+    )
+
+
 def latest_handover_submitter(handover):
     submission = handover.approval_history.filter(
         decision=HandoverApproval.Decision.SUBMITTED_FOR_MD,
@@ -531,9 +541,13 @@ class AccountListCreateView(APIView):
         try:
             with transaction.atomic():
                 user = serializer.save()
-                AuditEvent.objects.create(actor=request.user, action="account.created", subject=user.username,
+                event = AuditEvent.objects.create(actor=request.user, action="account.created", subject=user.username,
                     details={"role": user.role, "account_type": user.account_type, "is_superuser": False})
                 issue_account_action_token(user, AccountActionToken.Kind.INVITATION, request.user)
+                notify_account_event(
+                    event, "Account created",
+                    f"An account was created for {user.username}."
+                )
         except AccountEmailDeliveryError:
             return Response({"detail": "The invitation email could not be sent. No account was created; check email configuration and try again."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
         return Response(AccountSummarySerializer(user).data, status=status.HTTP_201_CREATED)
@@ -589,11 +603,20 @@ class AccountDetailView(APIView):
                                   details={"role": updated.role, "account_type": updated.account_type,
                                            "is_superuser": updated.is_superuser})
         if old_active != updated.is_active:
-            AuditEvent.objects.create(actor=request.user, action="account.activated" if updated.is_active else "account.deactivated",
+            event = AuditEvent.objects.create(actor=request.user, action="account.activated" if updated.is_active else "account.deactivated",
                 subject=updated.username, details={"is_active": updated.is_active})
+            action_label = "activated" if updated.is_active else "deactivated"
+            notify_account_event(
+                event, f"Account {action_label}",
+                f"The account for {updated.username} was {action_label}."
+            )
         if old_role != updated.role:
-            AuditEvent.objects.create(actor=request.user, action="account.role_changed", subject=updated.username,
+            event = AuditEvent.objects.create(actor=request.user, action="account.role_changed", subject=updated.username,
                 details={"role_from": old_role, "role_to": updated.role})
+            notify_account_event(
+                event, "Account role changed",
+                f"The account role for {updated.username} was changed."
+            )
         return Response(AccountSummarySerializer(updated).data)
 
 
@@ -699,7 +722,11 @@ class PasswordSetupView(APIView):
                 if not was_active and user.is_active:
                     AuditEvent.objects.create(actor=user, action="account.activated", subject=user.username,
                         details={"activation_method": "invitation"})
-                    AuditEvent.objects.create(actor=user, action="account.invitation_accepted", subject=user.username, details={})
+                    event = AuditEvent.objects.create(actor=user, action="account.invitation_accepted", subject=user.username, details={})
+                    notify_account_event(
+                        event, "Account invitation accepted",
+                        f"{user.username} completed account activation."
+                    )
                 else:
                     AuditEvent.objects.create(actor=user, action="account.password_reset_completed", subject=user.username, details={})
         except AccountActionToken.DoesNotExist:
@@ -1022,6 +1049,35 @@ class CommissionLedgerTransitionView(APIView):
                         "payout_date": entry.payout_date.isoformat() if entry.payout_date else None,
                         "payout_amount_lkr": str(entry.payout_amount_lkr) if entry.payout_amount_lkr is not None else None,
                         "reason": entry.reversal_reason or None})
+
+                if (
+                    entry.recipient_id
+                    and entry.recipient.is_active
+                    and entry.recipient.role == User.Role.REP
+                ):
+                    title, message = {
+                        "approved": (
+                            "Commission approved",
+                            f"Your commission for sale {entry.sale.reference} has been approved for payout.",
+                        ),
+                        "paid": (
+                            "Commission paid",
+                            f"Your commission payout for sale {entry.sale.reference} has been recorded.",
+                        ),
+                        "reversed": (
+                            "Commission reversed",
+                            f"Your commission for sale {entry.sale.reference} has been reversed. Contact management for details.",
+                        ),
+                    }[action]
+
+                    create_notifications(
+                        [entry.recipient],
+                        f"commission:{entry.pk}:{action}",
+                        title,
+                        message,
+                        "/staff/my-commissions",
+                    )
+
                 return Response(self.data(entry))
         except CommissionLedgerEntry.DoesNotExist:
             return Response({"detail": "Commission entry not found."}, status=status.HTTP_404_NOT_FOUND)
@@ -1158,6 +1214,11 @@ class ManagerSalesView(APIView):
                     vehicle = Vehicle.objects.select_for_update().get(pk=import_order.vehicle_id)
                     if vehicle.status != Vehicle.Status.AVAILABLE:
                         return Response({"import_reference": "The import vehicle is no longer available."}, status=status.HTTP_409_CONFLICT)
+                    if import_order.agreed_price_lkr is not None and data["agreed_price_lkr"] != import_order.agreed_price_lkr:
+                        return Response(
+                            {"agreed_price_lkr": "Sale price must match the agreed import price. Update the import price first."},
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
                     already_paid = Payment.objects.filter(import_order=import_order, status=Payment.Status.VERIFIED).aggregate(total=Sum("amount_lkr"))["total"] or Decimal("0.00")
                     if already_paid > data["agreed_price_lkr"]:
                         return Response({"agreed_price_lkr": "Verified import payments already exceed this sale price."}, status=status.HTTP_400_BAD_REQUEST)
@@ -1617,6 +1678,19 @@ class HandoverFinalizeView(APIView):
                     AuditEvent.objects.create(actor=request.user, action="commission.pending_created", subject=sale.reference,
                         details={"handover_reference": handover.reference, "recipient_id": recipient_id,
                                  "rate_status": policy_snapshot["rate_status"], "amount_lkr": str(amount) if amount is not None else None})
+                if created and recipient_id:
+                    recipients = User.objects.filter(
+                        pk=recipient_id,
+                        role=User.Role.REP,
+                        is_active=True,
+                    )
+                    create_notifications(
+                        recipients,
+                        f"commission:{ledger.pk}:pending",
+                        "New commission entry",
+                        f"A commission entry for sale {sale.reference} is available for review.",
+                        "/staff/my-commissions",
+                    )
                 financial_summary = HandoverSerializer(handover).data["financial_summary"]
                 approval, event = record_handover_decision(handover, request.user, HandoverApproval.Decision.FINALIZED,
                     before, handover.status, audit_action="handover.finalized", audit_details={"sale_reference": sale.reference, "vehicle_reference": vehicle.reference,
@@ -1844,12 +1918,15 @@ class PaymentCollectionView(APIView):
                         return Response({"reservation_reference": "Payments can only be recorded against an active reservation."}, status=status.HTTP_409_CONFLICT)
                 else:
                     try:
-                        import_order = ImportOrder.objects.select_for_update().get(reference=import_reference)
+                        import_id = ImportOrder.objects.only("pk").get(reference=import_reference).pk
                     except ImportOrder.DoesNotExist:
                         return Response({"import_reference": "Import order not found."}, status=status.HTTP_404_NOT_FOUND)
-                    linked_sale_id = Sale.objects.filter(import_order=import_order).values_list("pk", flat=True).first()
+                    linked_sale_id = Sale.objects.filter(import_order_id=import_id).values_list("pk", flat=True).first()
                     if linked_sale_id:
                         sale = Sale.objects.select_for_update().get(pk=linked_sale_id)
+                    import_order = ImportOrder.objects.select_for_update().get(pk=import_id)
+                    if not sale and Sale.objects.filter(import_order=import_order).exists():
+                        return Response({"detail": "The import was linked to a sale. Refresh and retry."}, status=status.HTTP_409_CONFLICT)
                 scope = Q(sale=sale) if sale else Q(reservation=reservation) if reservation else Q(import_order=import_order)
                 if sale and sale.reservation_id:
                     scope |= Q(reservation_id=sale.reservation_id)
@@ -1857,7 +1934,11 @@ class PaymentCollectionView(APIView):
                     scope |= Q(import_order_id=sale.import_order_id)
                 if import_order:
                     scope |= Q(import_order=import_order)
-                ceiling = sale.agreed_price_lkr if sale else reservation.agreed_price_lkr if reservation else None
+                ceiling = (
+                    sale.agreed_price_lkr if sale else
+                    reservation.agreed_price_lkr if reservation else
+                    import_order.agreed_price_lkr if import_order else None
+                )
                 if ceiling is not None:
                     received = Payment.objects.filter(scope, status=Payment.Status.VERIFIED).aggregate(total=Sum("amount_lkr"))["total"] or Decimal("0.00")
                     if received + data["amount_lkr"] > ceiling:
@@ -1971,12 +2052,26 @@ class PaymentVerifyView(APIView):
                     amount_scope = Q(reservation=reservation) | Q(sale=sale) if sale else Q(reservation=reservation)
                     ceiling = sale.agreed_price_lkr if sale else reservation.agreed_price_lkr
                 else:
-                    import_order = ImportOrder.objects.select_for_update().get(pk=payment.import_order_id)
+                    linked_sale_id = Sale.objects.filter(
+                        import_order_id=payment.import_order_id
+                    ).values_list("pk", flat=True).first()
+                    if linked_sale_id:
+                        sale = Sale.objects.select_for_update().get(pk=linked_sale_id)
+
+                    import_order = ImportOrder.objects.select_for_update().get(
+                        pk=payment.import_order_id
+                    )
+                    if not sale and Sale.objects.filter(import_order=import_order).exists():
+                        return Response({"detail": "The import was linked to a sale. Refresh and retry."}, status=status.HTTP_409_CONFLICT)
+
                     amount_scope = Q(import_order=import_order)
-                    sale = Sale.objects.filter(import_order=import_order).first()
+                    ceiling = import_order.agreed_price_lkr
                     if sale:
                         amount_scope |= Q(sale=sale)
                         ceiling = sale.agreed_price_lkr
+
+                if sale and sale.import_order_id:
+                    amount_scope |= Q(import_order_id=sale.import_order_id)
 
                 verified_total = Payment.objects.filter(status=Payment.Status.VERIFIED).filter(amount_scope).aggregate(total=Sum("amount_lkr"))["total"] or Decimal("0.00")
                 if ceiling is not None and verified_total + payment.amount_lkr > ceiling:
@@ -2263,7 +2358,55 @@ class QuotationPDFView(APIView):
 
 class ImportPaymentSummaryView(APIView):
     permission_classes = [PaymentAccess]
-    payment_action = "settlement_summary"
+    payment_action = "import_settlement"
+
+    def patch(self, request, reference):
+        from .serializers import ImportAgreedPriceSerializer
+
+        serializer = ImportAgreedPriceSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        price = serializer.validated_data["agreed_price_lkr"]
+
+        with transaction.atomic():
+            order = get_object_or_404(
+                ImportOrder.objects.select_for_update(),
+                reference=reference,
+            )
+
+            if order.sales.exists():
+                return Response(
+                    {"detail": "A linked sale already determines this price."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            received = Payment.objects.filter(
+                import_order=order,
+                status=Payment.Status.VERIFIED,
+            ).aggregate(total=Sum("amount_lkr"))["total"] or Decimal("0.00")
+
+            if price < received:
+                return Response(
+                    {"agreed_price_lkr": "Price cannot be lower than confirmed payments."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            previous = order.agreed_price_lkr
+            if previous != price:
+                order.agreed_price_lkr = price
+                order.save(update_fields=["agreed_price_lkr", "updated_at"])
+
+                AuditEvent.objects.create(
+                    actor=request.user,
+                    action="import.agreed_price.updated",
+                    subject=order.reference,
+                    details={
+                        "previous_price_lkr": str(previous) if previous is not None else None,
+                        "agreed_price_lkr": str(price),
+                        "reason": serializer.validated_data["reason"],
+                    },
+                )
+
+        return self.get(request, reference)
 
     def get(self, request, reference):
         order = get_object_or_404(ImportOrder, reference=reference)
@@ -2278,7 +2421,12 @@ class ImportPaymentSummaryView(APIView):
             pending_count=Count("id", filter=Q(status=Payment.Status.PENDING)),
             rejected_count=Count("id", filter=Q(status=Payment.Status.REJECTED)),
         )
+        price = sale.agreed_price_lkr if sale else order.agreed_price_lkr
+        received = totals["verified"] or Decimal("0.00")
         return Response({"import_reference": order.reference,
+            "linked_sale_reference": sale.reference if sale else None,
+            "agreed_price_lkr": price,
+            "price_source": "sale" if sale else "import" if price is not None else "unset",
             "customer_name": order.customer.full_name,
             "vehicle_name": (f"{sale.vehicle.manufacture_year} {sale.vehicle.make} {sale.vehicle.model} {sale.vehicle.variant}".strip() if sale and sale.vehicle_id else order.vehicle_description),
             "vehicle_reference": sale.vehicle.reference if sale and sale.vehicle_id else (order.vehicle.reference if order.vehicle_id else None),
@@ -2288,7 +2436,7 @@ class ImportPaymentSummaryView(APIView):
             "verified_amount_lkr": totals["verified"] or Decimal("0.00"),
             "pending_amount_lkr": totals["pending"] or Decimal("0.00"),
             "rejected_amount_lkr": totals["rejected"] or Decimal("0.00"),
-            "outstanding_balance_lkr": max(Decimal("0.00"), sale.agreed_price_lkr - (totals["verified"] or Decimal("0.00"))) if sale else None,
+            "outstanding_balance_lkr": max(Decimal("0.00"), price - received) if price is not None else None,
             "verified_count": totals["verified_count"], "pending_count": totals["pending_count"],
             "rejected_count": totals["rejected_count"]})
 

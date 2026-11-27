@@ -104,6 +104,10 @@ class PaymentAccess(BasePermission):
             return False
         role = request.user.role
         action = getattr(view, "payment_action", "")
+        if action == "import_settlement":
+            if request.method in {"GET", "HEAD", "OPTIONS"}:
+                return role in {"staff", "ceo", "manager"}
+            return request.method == "PATCH" and role in {"ceo", "manager"}
         if action == "settlement_summary":
             return request.method in {"GET", "HEAD", "OPTIONS"} and role in {"staff", "ceo", "manager"}
         if action == "record":
