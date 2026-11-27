@@ -3,14 +3,14 @@ import { resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 export const root = resolve(import.meta.dirname, '..', '..');
-export const artifacts = resolve(root, 'test-harness', 'artifacts');
+export const artifacts = resolve(process.env.SSP_TEST_ARTIFACTS_DIR ?? resolve(root, 'test-harness', 'artifacts'));
 export const screenshots = resolve(artifacts, 'screenshots');
 export const emails = resolve(artifacts, 'emails');
 export const stateFile = resolve(artifacts, 'run-state.json');
 mkdirSync(screenshots, { recursive: true });
 mkdirSync(emails, { recursive: true });
 
-export function readEnvFile(path = resolve(root, 'test-harness', '.env.test')) {
+export function readEnvFile(path = process.env.SSP_TEST_ENV_FILE ?? resolve(root, 'test-harness', '.env.test')) {
   const values = {};
   for (const line of readFileSync(path, 'utf8').split(/\r?\n/)) {
     const match = line.match(/^\s*([^#=]+)=(.*)$/);
@@ -107,7 +107,9 @@ export function listEmails() {
 
 export function invitationLink(fileName, kind = 'accept-invitation') {
   const text = readFileSync(resolve(emails, fileName), 'utf8');
-  const match = text.match(new RegExp(`http:\\/\\/localhost:3100\\/staff\\/${kind}\\?token=[A-Za-z0-9_-]+`));
+  const origin = process.env.SSP_TEST_BASE_URL ?? 'http://localhost:3100';
+  const escapedOrigin = origin.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&');
+  const match = text.match(new RegExp(`${escapedOrigin}\\/staff\\/${kind}\\?token=[A-Za-z0-9_-]+`));
   if (!match) throw new Error(`No local ${kind} link found in generated test email ${fileName}.`);
   return match[0];
 }

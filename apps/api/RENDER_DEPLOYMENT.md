@@ -7,7 +7,7 @@ Create a **Python Web Service** for this repository with root directory `apps/ap
 - Start command: `gunicorn config.wsgi:application --bind 0.0.0.0:$PORT`
 - Health check path: `/healthz`
 
-The build collects Django static files into `apps/api/staticfiles`; WhiteNoise serves them from the application. Uploaded files are not build artifacts and must not be committed.
+The build collects Django static files into `apps/api/staticfiles`; WhiteNoise serves them from the application. Uploaded files are not build artifacts and must not be committed. The API uses host-only CSRF and session cookies; do not configure `CSRF_COOKIE_DOMAIN` to `.onrender.com`.
 
 ## Environment variables
 
@@ -33,7 +33,35 @@ Render's `RENDER_EXTERNAL_HOSTNAME` is appended automatically to `DJANGO_ALLOWED
 
 ## HTTPS and cookies
 
-With `DJANGO_DEBUG=0`, Django enables SSL redirects and secure session/CSRF cookies. Render terminates HTTPS at its proxy; Django trusts Render's `X-Forwarded-Proto: https` header so requests already served over HTTPS are not redirected repeatedly. Configure the frontend and API on compatible same-site domains for the existing `SameSite=Lax` session cookies, and list the frontend's exact origin in both CORS and CSRF settings.
+With `DJANGO_DEBUG=0`, Django enables SSL redirects and secure session/CSRF cookies. Render terminates HTTPS at its proxy; Django trusts Render's `X-Forwarded-Proto: https` header so requests already served over HTTPS are not redirected repeatedly. The Next.js frontend proxies browser `/api/...` calls to Django, forwarding the browser Origin, Referer, CSRF header and cookies; Django's response cookies are returned host-only on the frontend origin. Set the frontend's exact HTTPS origin in `CSRF_TRUSTED_ORIGINS`. Keep CORS origins explicit for integrations that still call Django directly.
+
+## Next.js frontend service and authentication proxy
+
+The frontend must run as a **Node Web Service**, not a Static Site. Set root directory `apps/web`, build command `npm ci --include=dev && npm run build`, and start command `npm run start -- --hostname 0.0.0.0 --port $PORT`. Add this server-only variable to the frontend service:
+
+| Variable | Value |
+| --- | --- |
+| `API_UPSTREAM_URL` | `https://<backend-render-hostname>` |
+
+Remove `NEXT_PUBLIC_API_BASE_URL` from the frontend service; the browser uses same-origin API routes and must never receive the upstream URL. Do not put database or Django secrets in the frontend service. Keep `CSRF_TRUSTED_ORIGINS` on the backend set to the exact frontend URL (for example `https://ssp-frontend-xrli.onrender.com`). `CORS_ALLOWED_ORIGINS` may remain set to that exact origin; do not use wildcard origins. Never configure a shared `.onrender.com` cookie domain.
+
+## Free instance database initialization
+
+Render Free web services do not provide Dashboard Shell access or pre-deploy commands. The build command must not run migrations. If both services remain Free, a practical single-instance fallback is to run migrations in the backend start command before Gunicorn:
+
+```sh
+python manage.py migrate --noinput && gunicorn config.wsgi:application --bind 0.0.0.0:$PORT
+```
+
+Migrations are designed to be repeatable, but this starts the service only after they finish and can delay/cause a failed restart if a migration fails. Use a single backend instance; review migration lock/runtime impact and take a database backup before schema changes. For a production-grade release, upgrade the API service to a plan with a pre-deploy command and run `python manage.py migrate --noinput` there before traffic switches.
+
+Free services also lack a safe server shell for `createsuperuser` or database inspection. Do not add a public bootstrap endpoint or a default password. Temporarily upgrade the API service to enable Shell access, then verify account existence without printing personal data, for example:
+
+```sh
+python manage.py shell -c "from accounts.models import User; print({'count': User.objects.count(), 'roles': sorted(set(User.objects.values_list('role', flat=True)))})"
+```
+
+If no production Admin exists, run `python manage.py createsuperuser` through that authenticated Shell session and enter a unique, strong password interactively. Confirm the resulting role and sign-in through the frontend. Local development or test accounts are not production accounts. Do not run account creation against a local/test database by mistake; first confirm the Render service's internal `POSTGRES_*` configuration is attached. Free services are intended for evaluation rather than production workloads; persistent database and media backups remain necessary.
 
 ## Uploaded media persistence
 

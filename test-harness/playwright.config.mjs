@@ -2,13 +2,14 @@ import { defineConfig } from 'playwright/test';
 
 export default defineConfig({
   testDir: './specs',
-  outputDir: './artifacts/test-results',
+  outputDir: process.env.SSP_TEST_RESULTS_DIR ?? './artifacts/test-results',
   fullyParallel: false,
   workers: 1,
   retries: 0,
-  reporter: [['list'], ['html', { outputFolder: './artifacts/html-report', open: 'never' }]],
+  reporter: [['list'], ['html', { outputFolder: process.env.SSP_TEST_REPORT_DIR ?? './artifacts/html-report', open: 'never' }]],
   use: {
-    baseURL: 'http://localhost:3100',
+    baseURL: process.env.SSP_TEST_BASE_URL ?? 'http://localhost:3100',
+    ignoreHTTPSErrors: true,
     browserName: 'chromium',
     headless: true,
     screenshot: 'on',
