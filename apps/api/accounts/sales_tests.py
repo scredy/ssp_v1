@@ -4,8 +4,10 @@ from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 from rest_framework import status
 from rest_framework.test import APITestCase
+from django.utils import timezone
 
-from .models import AuditEvent, CommissionLedgerEntry, Customer, Handover, Payment, RepresentativeProfile, Reservation, Sale, User, Vehicle
+from .models import (AuditEvent, BLApprovalRequest, CommissionLedgerEntry, Customer, Handover, ImportMilestone,
+                     ImportOrder, Payment, RepresentativeProfile, Reservation, Sale, User, Vehicle)
 
 
 class SalesApiTests(APITestCase):
@@ -43,6 +45,114 @@ class SalesApiTests(APITestCase):
         self.assertEqual(self.vehicle.status, Vehicle.Status.SOLD)
         self.assertNotIn(self.vehicle.reference, [v["reference"] for v in self.client.get("/api/cars/").data])
         self.assertTrue(AuditEvent.objects.filter(action="sale.confirmed", subject=response.data["reference"]).exists())
+
+    def test_import_order_requires_registered_ready_stock_then_completes_sale_payment_handover_and_commission(self):
+        rep_user = User.objects.create_user(username="import-sale-rep", password="Test-pass-912!", role=User.Role.REP)
+        rep = RepresentativeProfile.objects.create(user=rep_user)
+        self.client.force_authenticate(self.staff)
+        created = self.client.post("/api/staff/imports/", {
+            "customer_id": self.customer.pk, "vehicle_id": self.vehicle.pk,
+            "vehicle_description": "Toyota Corolla import", "vehicle_details": "Fictional test vehicle",
+            "country_of_origin": "Japan", "shipping_information": "Fictional freight",
+            "estimated_arrival": "2026-12-20", "internal_notes": "Test only",
+            "customer_updates": "Booking confirmed for test.",
+        }, format="json")
+        self.assertEqual(created.status_code, status.HTTP_201_CREATED, created.data)
+        order_ref = created.data["reference"]
+        order = ImportOrder.objects.get(reference=order_ref)
+        self.assertEqual(order.vehicle_id, self.vehicle.pk)
+        self.assertEqual(order.status, ImportOrder.Status.NEW)
+
+        self.client.force_authenticate(self.manager)
+        sale_payload = {"sale_type": "import", "import_reference": order_ref, "representative_id": rep.pk,
+                        "agreed_price_lkr": "9750000.00", "sale_date": "2026-11-21"}
+        blocked = self.client.post("/api/manager/sales/", sale_payload, format="json")
+        self.assertEqual(blocked.status_code, status.HTTP_409_CONFLICT)
+        self.assertIn("Only ready imports", blocked.data["import_reference"])
+
+        milestone_url = f"/api/staff/imports/{order_ref}/milestones/"
+        self.client.force_authenticate(self.staff)
+        for kind, description in (("booking_confirmed", "Fictional booking confirmed."),
+                                  ("lc_opened", "Fictional letter of credit opened.")):
+            response = self.client.post(milestone_url, {"kind": kind, "customer_description": description}, format="json")
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        approval = self.client.post(f"/api/staff/imports/{order_ref}/bl-requests/",
+                                    {"request_note": "Fictional carrier document ready."}, format="json")
+        self.assertEqual(approval.status_code, status.HTTP_201_CREATED, approval.data)
+        self.client.force_authenticate(self.ceo)
+        decision = self.client.post(f"/api/staff/bl-requests/{approval.data['id']}/decision/",
+                                    {"decision": "approved"}, format="json")
+        self.assertEqual(decision.status_code, status.HTTP_200_OK, decision.data)
+        self.client.force_authenticate(self.staff)
+        for kind, description in (("bl_issued", "Fictional bill of lading issued."),
+                                  ("shipping", "Fictional shipment departed."),
+                                  ("arrival", "Fictional vehicle arrived."),
+                                  ("customs_clearance", "Fictional customs clearance completed."),
+                                  ("ready_for_collection", "Fictional vehicle ready for collection.")):
+            response = self.client.post(milestone_url, {"kind": kind, "customer_description": description}, format="json")
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        order.refresh_from_db()
+        self.assertEqual(order.status, ImportOrder.Status.READY_FOR_COLLECTION)
+        self.assertEqual(order.vehicle_id, self.vehicle.pk)
+        self.assertEqual(self.vehicle.status, Vehicle.Status.AVAILABLE)
+
+        self.client.force_authenticate(self.manager)
+        sale = self.client.post("/api/manager/sales/", sale_payload, format="json")
+        self.assertEqual(sale.status_code, status.HTTP_201_CREATED, sale.data)
+        self.assertEqual(sale.data["customer_id"], self.customer.pk)
+        self.assertEqual(sale.data["vehicle_reference"], self.vehicle.reference)
+        confirmed = self.client.post(f"/api/manager/sales/{sale.data['reference']}/confirm/", {}, format="json")
+        self.assertEqual(confirmed.status_code, status.HTTP_200_OK, confirmed.data)
+        self.vehicle.refresh_from_db()
+        self.assertEqual(self.vehicle.status, Vehicle.Status.SOLD)
+
+        payment = self.client.post("/api/staff/payments/", {
+            "sale_reference": sale.data["reference"], "amount_lkr": "2500000.00", "method": "bank_transfer",
+            "transaction_reference": "IMPORT-SALE-INTEGRATION-PAYMENT", "idempotency_key": "import-sale-integration-payment",
+            "payment_date": "2026-11-21", "funds_cleared": True,
+        }, format="json")
+        self.assertEqual(payment.status_code, status.HTTP_201_CREATED, payment.data)
+        self.assertEqual(payment.data["status"], Payment.Status.VERIFIED)
+        summary = self.client.get(f"/api/manager/sales/{sale.data['reference']}/payments/summary/")
+        self.assertEqual(summary.status_code, status.HTTP_200_OK)
+        self.assertEqual(summary.data["verified_received_lkr"], Decimal("2500000.00"))
+        self.assertEqual(summary.data["outstanding_balance_lkr"], Decimal("7250000.00"))
+
+        today = timezone.localdate().isoformat()
+        self.client.force_authenticate(self.ceo)
+        policy = self.client.put("/api/commission-rules/brackets/", [{
+            "minimum_lkr": "0", "maximum_lkr": None, "percentage": "2.5", "effective_date": today, "active": True,
+        }], format="json")
+        self.assertEqual(policy.status_code, status.HTTP_200_OK, policy.data)
+        self.client.force_authenticate(self.staff)
+        prepared = self.client.post("/api/staff/handovers/", {
+            "sale_reference": sale.data["reference"],
+            "delivery_date": "2026-11-27",
+            "customer_acknowledgement": "Fictional customer acknowledges the delivery details.",
+            "vehicle_condition_checklist": {key: True for key in ("bodywork", "interior", "tyres", "lights", "odometer")},
+            "keys_documents_checklist": {key: True for key in ("keys", "registration_documents", "insurance_documents", "service_documents")},
+        }, format="json")
+        self.assertEqual(prepared.status_code, status.HTTP_201_CREATED, prepared.data)
+        handover_ref = prepared.data["reference"]
+        self.assertEqual(prepared.data["financial_summary"]["outstanding_balance_lkr"], Decimal("7250000.00"))
+        detail = f"/api/staff/handovers/{handover_ref}/"
+        self.assertEqual(self.client.post(f"{detail}submit/", {}, format="json").status_code, status.HTTP_200_OK)
+        self.client.force_authenticate(self.manager)
+        self.assertEqual(self.client.post(f"{detail}approve-md/", {}, format="json").status_code, status.HTTP_200_OK)
+        self.client.force_authenticate(self.ceo)
+        approved = self.client.post(f"{detail}approve-ceo/", {}, format="json")
+        self.assertEqual(approved.status_code, status.HTTP_200_OK, approved.data)
+        self.client.force_authenticate(self.manager)
+        finalized = self.client.post(f"{detail}finalize/", {}, format="json")
+        self.assertEqual(finalized.status_code, status.HTTP_200_OK, finalized.data)
+        self.assertTrue(finalized.data["commission_eligible"])
+        self.assertEqual(finalized.data["financial_summary"]["outstanding_balance_lkr"], Decimal("7250000.00"))
+        order.refresh_from_db(); self.vehicle.refresh_from_db()
+        self.assertEqual(order.status, ImportOrder.Status.HANDED_OVER)
+        self.assertEqual(self.vehicle.status, Vehicle.Status.HANDED_OVER)
+        ledger = CommissionLedgerEntry.objects.get(sale__reference=sale.data["reference"])
+        self.assertEqual(ledger.recipient_id, rep_user.pk)
+        self.assertEqual(ledger.commission_rate_percent, Decimal("2.500"))
 
     def test_reserved_vehicle_sale_converts_matching_reservation_and_preserves_it(self):
         self.vehicle.status = Vehicle.Status.RESERVED
