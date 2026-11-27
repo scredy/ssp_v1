@@ -88,9 +88,10 @@ export default function AccountsPage() {
     if (editing) common.username = String(form.get("username") ?? "").trim();
     if (!editing || (editing.role !== "admin" && !editing.is_superuser) || (currentUser?.is_superuser && !editing.is_superuser)) {
       common.role = String(form.get("role") ?? "");
-      if (editing && common.role !== editing.role && (common.role === "admin" || editing.role === "admin")) {
-        const action = common.role === "admin" ? "promote this user to Admin" : "remove this user's Admin role";
-        if (!window.confirm(`Confirm you want to ${action}? Admin accounts can manage all SSP accounts.`)) { setBusy(false); return; }
+      if (editing && common.role !== editing.role) {
+        const previousRole = editing.is_superuser ? "Superuser" : roleLabels[editing.role] ?? editing.role;
+        const nextRole = roleLabels[common.role] ?? common.role;
+        if (!window.confirm(`Change ${editing.username}'s role from ${previousRole} to ${nextRole}? This change takes effect immediately.`)) { setBusy(false); return; }
       }
     }
     try {

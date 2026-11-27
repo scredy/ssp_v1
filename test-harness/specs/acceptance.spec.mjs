@@ -217,6 +217,23 @@ test('Admin onboarding, invitations, password setup/reset, and audit', async ({ 
       writeState(state);
     }
 
+    await step(page, 'Superuser', 'Confirm before changing an employee role', 'Role changes require explicit confirmation before being saved', async () => {
+      const row = page.getByRole('row').filter({ hasText: 'staff.acceptance@example.com' });
+      await row.getByRole('button', { name: 'Edit' }).click();
+      const form = page.locator('form.account-form');
+      await form.locator('select[name="role"]').selectOption('manager');
+      const confirmation = new Promise((resolve) => page.once('dialog', async (dialog) => {
+        expect(dialog.message()).toContain("Change pw_staff's role from Staff to MD/Manager?");
+        await dialog.dismiss();
+        resolve(true);
+      }));
+      await form.getByRole('button', { name: 'Save account' }).click();
+      await confirmation;
+      await expect(row.getByText('Staff', { exact: true })).toBeVisible();
+      await page.getByRole('button', { name: 'Cancel' }).click();
+      return 'The attempted role change was cancelled at the explicit confirmation prompt; the role stayed Staff.';
+    });
+
     await step(page, 'Admin', 'Issue password reset for Staff account', 'Admin action shows success and generates a local reset message', async () => {
       const row = page.getByRole('row').filter({ hasText: 'staff.acceptance@example.com' });
       await row.getByRole('button', { name: 'Send password reset' }).click();
