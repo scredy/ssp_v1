@@ -145,6 +145,8 @@ class HandoverAccess(BasePermission):
             return request.method == "POST" and role == "ceo"
         if action == "return":
             return request.method == "POST" and role in {"manager", "ceo"}
+        if action == "retry_completion_email":
+            return request.method == "POST" and role in {"manager", "ceo"}
         if action == "finalize":
             return request.method == "POST" and role == "manager"
         return False

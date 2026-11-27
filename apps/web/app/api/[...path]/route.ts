@@ -83,13 +83,23 @@ async function forward(request: Request, context: RouteContext) {
 
   const method = request.method.toUpperCase();
   const hasBody = method !== "GET" && method !== "HEAD";
+  // Django's local development server requires fixed-length request bodies.
+  // Preserve streaming for production deployments.
+  const bufferBody = hasBody && process.env.NODE_ENV === "development";
+
+  const body = hasBody
+    ? bufferBody
+      ? await request.arrayBuffer()
+      : request.body
+    : undefined;
+
   const init: StreamingRequestInit = {
     method,
     headers,
-    body: hasBody ? request.body : undefined,
+    body,
     cache: "no-store",
     redirect: "manual",
-    ...(hasBody ? { duplex: "half" as const } : {}),
+    ...(hasBody && !bufferBody ? { duplex: "half" as const } : {}),
   };
 
   let upstreamResponse: Response;

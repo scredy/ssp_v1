@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <meta name="supported-color-schemes" content="light">
+    <title>{{ title }}</title>
+  </head>
+  <body style="margin:0;padding:0;background:#f2f3f4;color:#17191c;font-family:Arial,Helvetica,sans-serif;-webkit-text-size-adjust:100%;">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f2f3f4;">
+      <tr><td align="center" style="padding:24px 12px;">
+        <table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:600px;border:1px solid #d7d9dc;border-radius:14px;overflow:hidden;background:#ffffff;">
+          <tr>
+            <td align="center" bgcolor="#111315" style="padding:22px 24px 20px;background-color:#111315;border-bottom:3px solid #c72d37;">
+              {% if logo_url %}<img src="{{ logo_url }}" width="190" alt="SSP Motor Trading" style="display:block;width:190px;max-width:75%;height:auto;border:0;outline:none;text-decoration:none;">{% else %}<span style="color:#ffffff;font-size:28px;font-weight:700;letter-spacing:3px;">SSP</span><br><span style="color:#aeb3b8;font-size:11px;font-weight:700;letter-spacing:4px;">MOTOR TRADING</span>{% endif %}
+            </td>
+          </tr>
+          <tr><td style="padding:34px 32px 30px;">
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+              <tr><td align="center" style="padding:0 0 10px;"><span aria-hidden="true" style="display:inline-block;width:42px;height:42px;border:2px solid #c72d37;border-radius:14px;color:#c72d37;font-size:26px;font-weight:700;line-height:42px;text-align:center;">&#10003;</span></td></tr>
+              <tr><td align="center" style="padding:0 0 6px;"><h1 style="margin:0;color:#17191c;font-size:30px;line-height:1.2;font-weight:700;">{{ title }}</h1></td></tr>
+              <tr><td align="center" style="padding:0 0 26px;"><p style="margin:0;color:#555b61;font-size:16px;line-height:1.55;">{{ subtitle }}</p></td></tr>
+              <tr><td style="padding:0 0 10px;"><p style="margin:0;color:#17191c;font-size:17px;line-height:1.5;font-weight:700;overflow-wrap:anywhere;">Hello {{ customer_name }},</p></td></tr>
+              <tr><td style="padding:0 0 20px;"><p style="margin:0;color:#555b61;font-size:16px;line-height:1.65;">{{ message }}</p></td></tr>
+              {% if reference %}
+              <tr><td style="padding:0 0 20px;">
+                <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f2f3f4;border-radius:10px;">
+                  <tr><td width="54" valign="middle" style="width:54px;padding:15px 0 15px 17px;color:#c72d37;font-size:22px;font-weight:700;line-height:1;">&#35;</td><td valign="middle" style="padding:14px 16px;border-left:1px solid #d3d5d8;"><span style="display:block;color:#555b61;font-size:13px;line-height:1.4;">Reference Number</span><strong style="display:block;margin-top:3px;color:#17191c;font-size:17px;line-height:1.4;overflow-wrap:anywhere;word-break:break-word;">{{ reference }}</strong></td></tr>
+                </table>
+              </td></tr>
+              {% endif %}
+              {% if info_rows %}
+              <tr><td style="padding:0 0 20px;"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;">
+                {% for label, value in info_rows %}<tr><td valign="top" style="padding:7px 10px 7px 0;color:#555b61;font-size:14px;line-height:1.45;width:34%;">{{ label }}</td><td valign="top" style="padding:7px 0;color:#17191c;font-size:14px;line-height:1.45;font-weight:600;overflow-wrap:anywhere;">{{ value }}</td></tr>{% endfor %}
+              </table></td></tr>
+              {% endif %}
+              {% if notice %}<tr><td style="padding:0 0 16px;"><p style="margin:0;padding:12px 14px;border-left:3px solid #c72d37;background:#f8f8f8;color:#555b61;font-size:14px;line-height:1.5;">{{ notice }}</p></td></tr>{% endif %}
+              {% if next_message %}<tr><td style="padding:0 0 22px;"><p style="margin:0 0 3px;color:#17191c;font-size:17px;line-height:1.4;font-weight:700;">{{ next_title }}</p><p style="margin:0;color:#555b61;font-size:15px;line-height:1.55;">{{ next_message }}</p></td></tr>{% endif %}
+              <tr><td style="padding:18px 0 0;border-top:1px solid #e1e3e5;"><p style="margin:0 0 4px;color:#555b61;font-size:15px;line-height:1.5;">Best regards,</p><p style="margin:0;color:#17191c;font-size:16px;line-height:1.5;font-weight:700;">SSP Motor Trading Team</p></td></tr>
+            </table>
+          </td></tr>
+          <tr><td bgcolor="#111315" style="padding:18px 24px;background-color:#111315;border-top:2px solid #c72d37;">
+            <p style="margin:0 0 4px;color:#ffffff;font-size:14px;line-height:1.5;font-weight:600;">SSP Motor Trading (Pvt) Ltd.</p>
+            {% if company_location %}<p style="margin:2px 0;color:#aeb3b8;font-size:12px;line-height:1.5;">{{ company_location }}</p>{% endif %}
+            {% if company_phone %}<p style="margin:2px 0;color:#aeb3b8;font-size:12px;line-height:1.5;">{{ company_phone }}</p>{% endif %}
+            {% if company_email %}<p style="margin:2px 0;color:#aeb3b8;font-size:12px;line-height:1.5;">{{ company_email }}</p>{% endif %}
+          </td></tr>
+        </table>
+      </td></tr>
+    </table>
+  </body>
+</html>

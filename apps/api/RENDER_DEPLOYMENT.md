@@ -45,6 +45,20 @@ ACCOUNT_PORTAL_URL=https://ssp-frontend-xrli.onrender.com
 
 Save and let Render restart the backend. Do not add `BREVO_API_KEY` to GitHub, the frontend service, or any `NEXT_PUBLIC_*` variable. The same backend handles employee and Admin invitations, secure password setup and resets, appointment confirmations, and the existing confirmation retry. The invitation transaction still rolls back if Brevo rejects a message or delivery fails; ambiguous timeouts are not automatically retried because Brevo may already have accepted the email.
 
+### Customer transactional email presentation
+
+Customer enquiry acknowledgements and staff-confirmed/rescheduled appointment messages use a shared Django HTML template with a plain-text alternative. The existing `ACCOUNT_PORTAL_URL` supplies the public logo URL (`/branding/ssp-logo-display.png`); ensure the frontend deploy includes the repository's `apps/web/public/branding/ssp-logo-display.png` asset. No new production environment variable is required. The template uses the existing web palette tokens (`#111315` charcoal, `#c72d37` SSP red, and `#aeb3b8` muted silver), plus white and neutral text backgrounds. Company contact fields remain optional and are shown only when configured.
+
+Vehicle handover completion emails use the shared branded customer template and are triggered only after successful MD finalization. The email displays the recorded completion date in Sri Lanka time.
+
+Migration `0027_handover_completion_email` must be applied during backend deployment. No additional environment variables are required.
+
+Email delivery status is visible to Staff, MD and CEO. Only MD and CEO can request eligible retries. Emails accepted by the mail service or currently sending cannot be retried. Failed attempts require confirmation that the previous message was not accepted before retrying.
+
+Email delivery failure does not reverse a completed handover. Existing finalized handovers are not emailed retrospectively. Interrupted attempts stuck in Sending require investigation before recovery.
+
+Reservation creation/release, quotation issue/void, sale confirmation, payment receipts and document delivery do not receive new automatic email triggers from this release.
+
 Render's `RENDER_EXTERNAL_HOSTNAME` is appended automatically to `DJANGO_ALLOWED_HOSTS` when present. Keep custom API domains in `DJANGO_ALLOWED_HOSTS`; the Render hostname addition does not replace them. Rejected hostnames are written by the `django.security.DisallowedHost` logger to service logs without logging request query strings or credentials.
 
 ## HTTPS and cookies
