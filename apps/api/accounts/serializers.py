@@ -14,7 +14,7 @@ from .payment_summaries import sale_payment_summary
 class CurrentUserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
-        fields = ("id", "username", "email", "first_name", "last_name", "role", "account_type")
+        fields = ("id", "username", "email", "first_name", "last_name", "role", "account_type", "is_superuser")
 
 
 class AccountSummarySerializer(serializers.ModelSerializer):
@@ -22,7 +22,7 @@ class AccountSummarySerializer(serializers.ModelSerializer):
 
     class Meta:
         model = User
-        fields = ("id", "username", "email", "first_name", "last_name", "phone", "role", "account_type", "is_active", "is_onboarded")
+        fields = ("id", "username", "email", "first_name", "last_name", "phone", "role", "account_type", "is_active", "is_onboarded", "is_superuser")
 
     def get_is_onboarded(self, user):
         return user.has_usable_password()
@@ -36,11 +36,6 @@ class AccountSerializer(serializers.ModelSerializer):
         model = User
         fields = ("id", "username", "email", "first_name", "last_name", "phone", "role", "account_type")
         read_only_fields = ("id",)
-
-    def validate_role(self, value):
-        if value == User.Role.ADMIN:
-            raise serializers.ValidationError("Admin accounts cannot be assigned through account management.")
-        return value
 
     def validate_email(self, value):
         if User.objects.filter(email__iexact=value).exists():
@@ -56,6 +51,8 @@ class AccountSerializer(serializers.ModelSerializer):
         user = User(**validated_data)
         user.account_type = User.AccountType.INTERNAL
         user.is_active = False
+        user.is_staff = False
+        user.is_superuser = False
         user.set_unusable_password()
         user.save()
         return user
@@ -65,11 +62,6 @@ class AccountUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = ("username", "email", "first_name", "last_name", "phone", "role", "account_type", "is_active")
-
-    def validate_role(self, value):
-        if value == User.Role.ADMIN:
-            raise serializers.ValidationError("Admin role cannot be assigned through account management.")
-        return value
 
     def validate_email(self, value):
         if User.objects.filter(email__iexact=value).exclude(pk=self.instance.pk).exists():

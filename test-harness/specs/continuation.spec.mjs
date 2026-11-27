@@ -46,9 +46,9 @@ test('Continuation: sales, payment review, handover, commission, Rep and notific
   try {
     await step(page, 'MD/Manager', 'Sign in and inspect sales controls', 'Manager can create/confirm sales and review read-only policy/ledger', async () => {
       await login(page, s.manager); await page.goto('/staff/sales');
-      if (!(await page.getByRole('button', { name: /New sale/ }).isVisible().catch(() => false))) throw new Error('Sales directory rendered but the Manager New sale control is absent; role UI check blocked follow-up UI mutations.');
+      await expect(page.getByRole('button', { name: /New sale/ })).toBeVisible();
       return 'Manager sales directory and New sale control loaded.';
-    }, { continueOnFailure: true });
+    });
 
     await step(page, 'MD/Manager', 'Verify reservation advance payment', 'Pending reservation payment can be reviewed and verified by an authorized Manager', async () => {
       await page.goto('/staff/payments');
@@ -110,21 +110,43 @@ test('Continuation: sales, payment review, handover, commission, Rep and notific
     await step(page, 'Staff', 'Advance import tracking through collection readiness', 'CEO-approved BL request is issued and import reaches ready for collection', async () => {
       await page.getByRole('button', { name: 'Sign out' }).click(); await login(page, s.staff); await page.goto('/staff/imports');
       await page.getByRole('row').filter({ hasText: s.importOrder }).click();
-      if (await page.locator('.import-detail').getByText(/ready for collection/i).count()) return `${s.importOrder} is already in Ready for collection after the previously completed milestone walk; no duplicate milestones added.`;
+      let order = await apiCall(page, `/api/staff/imports/${s.importOrder}/`);
+      expect(order.status).toBe(200);
+      let timeline = await apiCall(page, `/api/staff/imports/${s.importOrder}/milestones/`);
+      expect(timeline.status).toBe(200);
+      const recordedKinds = new Set(timeline.data.map(item => item.kind));
+      const linkedVehicle = async () => {
+        const inventory = await apiCall(page, '/api/staff/inventory/');
+        expect(inventory.status).toBe(200);
+        return inventory.data.find(item => item.reference === order.data.vehicle_reference);
+      };
+      // The UI includes every possible milestone in a select's option list, so
+      // matching its label does not prove the order reached that state. Use the
+      // persisted API state and milestone history as the source of truth.
+      const stockBeforeProgress = await linkedVehicle();
+      expect(stockBeforeProgress, 'Import must remain linked to its registered inventory vehicle.').toBeTruthy();
+      expect(stockBeforeProgress.status).toBe('available');
+      const alreadyReady = order.data.status === 'ready_for_collection'
+        && recordedKinds.has('ready_for_collection') && Boolean(order.data.vehicle_id);
+      if (alreadyReady) return `${s.importOrder} is persisted as ready for collection with its registered vehicle linked.`;
       const form = page.locator('.import-action-form').first();
       for (const [kind, desc] of [['bl_issued','Fictional bill of lading issued.'],['shipping','Fictional test shipment departed.'],['arrival','Fictional vehicle arrived at port.'],['customs_clearance','Fictional customs clearance recorded.'],['ready_for_collection','Fictional vehicle ready for collection.']]) {
-        const existing = await page.locator('.import-timeline li strong').allTextContents();
-        const title = kind.replaceAll('_', ' ').replace(/\b\w/g, x => x.toUpperCase());
-        if (existing.includes(title)) continue;
+        order = await apiCall(page, `/api/staff/imports/${s.importOrder}/`);
+        expect(order.status).toBe(200);
+        timeline = await apiCall(page, `/api/staff/imports/${s.importOrder}/milestones/`);
+        expect(timeline.status).toBe(200);
+        if (timeline.data.some(item => item.kind === kind)) continue;
         await form.getByLabel('Milestone').selectOption(kind);
         await form.getByLabel('Customer-safe description *').fill(desc);
         await form.getByRole('button', { name: 'Add milestone' }).click();
         await expect(page.getByRole('status')).toContainText('Milestone recorded');
       }
-      await expect(page.locator('.import-detail')).toContainText('Ready For Collection');
-      let order = await apiCall(page, `/api/staff/imports/${s.importOrder}/`);
+      order = await apiCall(page, `/api/staff/imports/${s.importOrder}/`);
+      timeline = await apiCall(page, `/api/staff/imports/${s.importOrder}/milestones/`);
       expect(order.status).toBe(200);
       expect(order.data.status).toBe('ready_for_collection');
+      expect(timeline.status).toBe(200);
+      expect(timeline.data.some(item => item.kind === 'ready_for_collection')).toBe(true);
       if (!order.data.vehicle_id) {
         const inventory = await apiCall(page, '/api/staff/inventory/');
         const stock = inventory.data.find(item => item.reference === s.vehicles[2].reference);
@@ -134,6 +156,8 @@ test('Continuation: sales, payment review, handover, commission, Rep and notific
         order = await apiCall(page, `/api/staff/imports/${s.importOrder}/`);
       }
       expect(order.data.vehicle_reference).toBe(s.vehicles[2].reference);
+      const readyStock = await linkedVehicle();
+      expect(readyStock.status).toBe('available');
       return `${s.importOrder} reached collection readiness with registered vehicle ${order.data.vehicle_reference} linked.`;
     });
 
@@ -145,7 +169,14 @@ test('Continuation: sales, payment review, handover, commission, Rep and notific
       const rep = opts.data.representatives.find(x => x.name.includes('Kavindu Silva'));
       const result = await apiCall(page, '/api/manager/sales/', 'POST', { sale_type: 'import', import_reference: s.importOrder, representative_id: rep.id, agreed_price_lkr: '17900000', sale_date: '2026-11-23' });
       expect(result.status, JSON.stringify(result.data)).toBe(201); const ref = result.data.reference; s.importSale = ref;
-      expect((await apiCall(page, `/api/manager/sales/${ref}/confirm/`, 'POST', {})).status).toBe(200);
+      expect(result.data.customer_id).toBeDefined();
+      expect(result.data.vehicle_reference).toBe(s.vehicles[2].reference);
+      const confirmed = await apiCall(page, `/api/manager/sales/${ref}/confirm/`, 'POST', {});
+      expect(confirmed.status, JSON.stringify(confirmed.data)).toBe(200);
+      const inventory = await apiCall(page, '/api/staff/inventory/');
+      const stock = inventory.data.find(item => item.reference === s.vehicles[2].reference);
+      expect(stock).toBeTruthy();
+      expect(stock.status).toBe('sold');
       writeState(s); return `Manager API fallback confirmed import sale ${ref} for ready order ${s.importOrder}.`;
     });
 
@@ -160,17 +191,27 @@ test('Continuation: sales, payment review, handover, commission, Rep and notific
       await page.getByRole('button', { name: 'Sign out' }).click(); await login(page, s.staff);
       if (s.handover) {
         const existing = await apiCall(page, `/api/staff/handovers/${s.handover}/`);
-        if (existing.status === 200) return `${s.handover} already exists with status ${existing.data.status}; no duplicate handover created.`;
+        if (existing.status === 200) {
+          s.reservationBalance = String(existing.data.financial_summary.outstanding_balance_lkr);
+          s.reservationBalanceDisplay = new Intl.NumberFormat('en-LK', { style: 'currency', currency: 'LKR', maximumFractionDigits: 2 }).format(Number(s.reservationBalance));
+          writeState(s);
+          return `${s.handover} already exists with status ${existing.data.status}; no duplicate handover created.`;
+        }
       }
       await page.goto(`/staff/handovers?sale_reference=${encodeURIComponent(s.reservationSale)}`);
       const form = page.locator('form.handover-form'); await expect(form).toBeVisible();
       await form.getByLabel('Delivery date *').fill('2026-11-24');
       await form.getByLabel('Customer acknowledgement *').fill('Elena Wickramasinghe acknowledges delivery details and the outstanding balance arrangement.');
       for (const label of ['Bodywork','Interior','Tyres','Lights','Odometer','Keys','Registration documents','Insurance documents','Service documents']) await form.getByLabel(label, { exact: true }).check();
-      await form.getByLabel('Internal notes / balance arrangement').fill('Manager-approved remaining balance of LKR 13,000,000 to be settled before document acknowledgment.');
+      await form.locator('.handover-form-card').filter({ hasText: 'Internal Notes / Balance Arrangement' }).locator('textarea').fill('Manager-approved remaining balance of LKR 13,000,000 to be settled before document acknowledgment.');
       await form.getByRole('button', { name: 'Save preparation' }).click();
       await expect(page.getByRole('status')).toContainText('saved');
       const ref = (await page.locator('.handover-detail h3').innerText()).trim(); s.handover = ref; writeState(s);
+      const prepared = await apiCall(page, `/api/staff/handovers/${ref}/`);
+      expect(prepared.status).toBe(200);
+      s.reservationBalance = String(prepared.data.financial_summary.outstanding_balance_lkr);
+      s.reservationBalanceDisplay = new Intl.NumberFormat('en-LK', { style: 'currency', currency: 'LKR', maximumFractionDigits: 2 }).format(Number(s.reservationBalance));
+      writeState(s);
       return `${ref} saved with complete checklists and Elena's acknowledgment; balance remains outstanding.`;
     });
 
@@ -182,16 +223,43 @@ test('Continuation: sales, payment review, handover, commission, Rep and notific
       return `${s.handover} submitted for review.`;
     });
 
-    await step(page, 'MD/Manager', 'Finalize handover with outstanding balance visible', 'Authorized Manager can finalize when required reservation down payment is verified; balance remains due', async () => {
+    await step(page, 'MD/Manager', 'Approve handover for CEO review', 'MD approval is recorded before CEO approval is available', async () => {
       await page.getByRole('button', { name: 'Sign out' }).click(); await login(page, s.manager); await page.goto('/staff/handovers');
       await page.getByRole('row').filter({ hasText: s.handover }).click();
-      const detail = page.locator('.handover-detail'); await expect(detail).toContainText('13,000,000');
+      const current = await apiCall(page, `/api/staff/handovers/${s.handover}/`);
+      expect(current.status).toBe(200);
+      if (current.data.status !== 'pending_md_review') return `${s.handover} already advanced to ${current.data.status}; MD approval is recorded.`;
+      await page.locator('.handover-detail').getByRole('button', { name: 'Approve & Submit to CEO' }).click();
+      await expect(page.getByRole('status')).toContainText('MD review approved');
+      const updated = await apiCall(page, `/api/staff/handovers/${s.handover}/`);
+      expect(updated.data.status).toBe('pending_ceo_approval');
+      return `${s.handover} received MD approval and moved to pending CEO approval.`;
+    });
+
+    await step(page, 'CEO', 'Approve handover for MD finalization', 'CEO approval follows MD approval and authorizes delivery', async () => {
+      await page.getByRole('button', { name: 'Sign out' }).click(); await login(page, s.ceo); await page.goto('/staff/handovers');
+      await page.getByRole('row').filter({ hasText: s.handover }).click();
+      const current = await apiCall(page, `/api/staff/handovers/${s.handover}/`);
+      expect(current.status).toBe(200);
+      if (current.data.status !== 'pending_ceo_approval') return `${s.handover} already advanced to ${current.data.status}; CEO approval is recorded.`;
+      await page.locator('.handover-detail').getByRole('button', { name: 'Approve Handover' }).click();
+      await expect(page.getByRole('status')).toContainText('CEO approval recorded');
+      const updated = await apiCall(page, `/api/staff/handovers/${s.handover}/`);
+      expect(updated.data.status).toBe('ceo_approved');
+      return `${s.handover} received CEO approval after MD review; MD finalization is now permitted.`;
+    });
+
+    await step(page, 'MD/Manager', 'Finalize handover with outstanding balance visible', 'Authorized Manager can finalize after both approvals while the balance remains due', async () => {
+      await page.getByRole('button', { name: 'Sign out' }).click(); await login(page, s.manager); await page.goto('/staff/handovers');
+      await page.getByRole('row').filter({ hasText: s.handover }).click();
+      const detail = page.locator('.handover-detail'); await expect(detail).toContainText(s.reservationBalanceDisplay);
       const existing = await apiCall(page, `/api/staff/handovers/${s.handover}/`);
-      if (existing.status === 200 && existing.data.status === 'finalized') return `${s.handover} is already finalized; UI still shows outstanding LKR 13,000,000.`;
-      await detail.getByRole('button', { name: 'Review and finalize' }).click();
+      if (existing.status === 200 && existing.data.status === 'finalized') return `${s.handover} is already finalized; UI still shows outstanding ${s.reservationBalanceDisplay}.`;
+      expect(existing.data.status).toBe('ceo_approved');
+      await detail.getByRole('button', { name: 'Finalize Handover' }).click();
       await page.getByRole('button', { name: 'Confirm handover finalization' }).click();
       await expect(page.getByRole('status')).toContainText('finalized');
-      return `${s.handover} finalized; UI shows outstanding LKR 13,000,000 and does not mark it paid.`;
+      return `${s.handover} finalized; UI shows outstanding ${s.reservationBalanceDisplay} and does not mark it paid.`;
     });
 
     await step(page, 'Staff', 'Issue and download document acknowledgment', 'Finalized handover issues acknowledgment and PDF download control', async () => {
@@ -206,30 +274,40 @@ test('Continuation: sales, payment review, handover, commission, Rep and notific
       return `Document acknowledgment issued and PDF download completed (${file.suggestedFilename()}).`;
     });
 
-    await step(page, 'Staff', 'Record outstanding-balance settlement', 'Staff records fictional LKR 13,000,000 settlement as pending verification', async () => {
+    await step(page, 'MD/Manager', 'Record outstanding-balance settlement', 'Authorized Manager records a fictional LKR 13,000,000 settlement as immediately confirmed', async () => {
       if (!s.balancePayment) {
-        await page.getByRole('button', { name: 'Sign out' }).click(); await login(page, s.staff);
+        await page.getByRole('button', { name: 'Sign out' }).click(); await login(page, s.manager);
         await page.goto(`/staff/payments?target_type=sale&reference=${encodeURIComponent(s.reservationSale)}`);
+        const currentSummary = await apiCall(page, `/api/manager/sales/${s.reservationSale}/payments/summary/`);
+        expect(currentSummary.status).toBe(200);
+        const balance = Number(currentSummary.data.outstanding_balance_lkr);
+        expect(balance).toBeGreaterThan(0);
         const form = page.locator('form.payment-form');
-        await form.getByLabel('Amount (LKR) *').fill('13000000'); await form.getByLabel('Payment method *').selectOption('bank_transfer');
+        await form.getByLabel('Payment amount (LKR) *').fill(balance.toFixed(2)); await form.getByLabel('Payment method *').selectOption('bank_transfer');
+        await form.getByLabel(/I confirm these funds have been received and cleared/).check();
         await form.getByLabel('Payment date *').fill('2026-11-23'); await form.getByLabel('Transaction reference').fill('PW-BALANCE-ELENA-01');
-        await form.getByLabel('Staff notes').fill('Fictional outstanding balance settlement.');
-        await form.getByRole('button', { name: 'Record payment' }).click(); await expect(page.getByRole('status')).toContainText('pending verification');
+        await form.getByLabel('Staff notes').fill(`Fictional outstanding balance settlement of LKR ${balance.toLocaleString('en-LK')}.`);
+        await form.getByRole('button', { name: 'Confirm & Record Payment' }).click();
+        await page.getByRole('dialog').getByRole('button', { name: 'Confirm & Record Payment' }).click();
+        await expect(page.getByRole('status')).toContainText('was confirmed and recorded');
         s.balancePayment = (await page.getByRole('status').innerText()).match(/PAY-[A-Z0-9-]+/)?.[0]; writeState(s);
       }
       const existing = await apiCall(page, `/api/staff/payments/${s.balancePayment}/`);
-      return `Staff recorded outstanding payment ${s.balancePayment}; current state ${existing.data?.status ?? 'unavailable'}.`;
+      expect(existing.status).toBe(200);
+      expect(existing.data.status).toBe('verified');
+      const settled = await apiCall(page, `/api/manager/sales/${s.reservationSale}/payments/summary/`);
+      expect(settled.status).toBe(200);
+      expect(Number(settled.data.outstanding_balance_lkr)).toBe(0);
+      return `Manager recorded and immediately confirmed the remaining sale balance in ${s.balancePayment}.`;
     });
 
-    await step(page, 'CEO', 'Verify outstanding-balance settlement', 'A different authorized reviewer verifies the recorded balance payment', async () => {
+    await step(page, 'CEO', 'Review outstanding-balance settlement', 'CEO can read the Manager-recorded and immediately confirmed balance payment', async () => {
       await page.getByRole('button', { name: 'Sign out' }).click(); await login(page, s.ceo); await page.goto('/staff/payments');
       const existing = await apiCall(page, `/api/staff/payments/${s.balancePayment}/`);
-      if (existing.status === 200 && existing.data.status === 'verified') return `Outstanding balance payment ${s.balancePayment} was already verified in a prior attempt.`;
-      const row = page.getByRole('row').filter({ hasText: s.balancePayment }); await expect(row).toBeVisible(); await row.click();
-      const verify = page.getByRole('button', { name: 'Verify payment' });
-      if (await verify.count()) { page.once('dialog', d => d.accept()); await verify.click(); await expect(page.getByRole('status').first()).toContainText(`${s.balancePayment} verified`); return `CEO verified ${s.balancePayment} through the UI.`; }
-      const result = await apiCall(page, `/api/staff/payments/${s.balancePayment}/verify/`, 'POST', {}); expect(result.status).toBe(200);
-      return `CEO payment detail UI did not expose Verify; authorized API fallback verified ${s.balancePayment} (HTTP ${result.status}).`;
+      expect(existing.status).toBe(200);
+      expect(existing.data.status).toBe('verified');
+      const row = page.getByRole('row').filter({ hasText: s.balancePayment }); await expect(row).toBeVisible();
+      return `CEO can review the already confirmed balance payment ${s.balancePayment}; no redundant verification transition was attempted.`;
     });
 
     await step(page, 'MD/Manager', 'Review commission ledger and approve earned Rep entry', 'Finalized eligible handover creates a pending commission that Manager can approve', async () => {
@@ -295,6 +373,7 @@ test('Continuation: sales, payment review, handover, commission, Rep and notific
 });
 
 test('Admin audit recheck after login throttle', async ({ browser }, info) => {
+  test.setTimeout(180_000);
   const state = readState(); const context = await browser.newContext({ baseURL }); await trace(context);
   const page = await context.newPage(); attachPageDiagnostics(page);
   try {
@@ -309,6 +388,9 @@ test('Admin audit recheck after login throttle', async ({ browser }, info) => {
 });
 
 test('Staff quotation draft, issue, and PDF workflow', async ({ browser }, info) => {
+  // The shared login endpoint deliberately throttles repeated test sign-ins;
+  // allow the test to wait for its Retry-After window instead of failing early.
+  test.setTimeout(180_000);
   const state = readState(); const context = await browser.newContext({ baseURL }); await trace(context);
   const page = await context.newPage(); attachPageDiagnostics(page);
   try {

@@ -10,7 +10,7 @@ export type Vehicle = {
   status?: "available" | "reserved" | "sold" | "handed_over" | "archived";
   internal_identifier?: string; created_at?: string; updated_at?: string;
 };
-export type User = { username: string; first_name: string; last_name: string; role: string; account_type: string };
+export type User = { username: string; first_name: string; last_name: string; role: string; account_type: string; is_superuser: boolean };
 
 function csrfToken() {
   return document.cookie.split("; ").find((item) => item.startsWith("csrftoken="))?.split("=")[1] ?? "";
