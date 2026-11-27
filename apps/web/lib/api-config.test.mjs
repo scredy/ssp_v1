@@ -1,57 +1,61 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { resolveApiBaseUrl } from "./api-config.mjs";
+import { resolveApiUpstreamUrl } from "./api-config.mjs";
 
-test("an unset API base URL stays unset instead of silently targeting a hardcoded port", async () => {
-  assert.equal(resolveApiBaseUrl(undefined), "");
-  const client = await readFile(new URL("./car-api.ts", import.meta.url), "utf8");
-  assert.match(client, /The SSP service is not configured\. Set NEXT_PUBLIC_API_BASE_URL and restart the web server\./);
+test("the trusted upstream accepts HTTPS deployment origins and local development HTTP", () => {
+  assert.equal(resolveApiUpstreamUrl("https://ssp-backend.example.onrender.com", "production"), "https://ssp-backend.example.onrender.com");
+  assert.equal(resolveApiUpstreamUrl("http://localhost:8000", "development"), "http://localhost:8000");
+  assert.equal(resolveApiUpstreamUrl("http://127.0.0.1:8000", "test"), "http://127.0.0.1:8000");
 });
 
-test("local web configuration documents the API base URL in the web app environment", async () => {
-  const webExample = await readFile(new URL("../.env.example", import.meta.url), "utf8");
-  assert.match(webExample, /^NEXT_PUBLIC_API_BASE_URL=http:\/\/localhost:8000$/m);
+test("untrusted schemes, credentials, paths, and missing configuration are rejected", () => {
+  assert.throws(() => resolveApiUpstreamUrl(undefined), /API_UPSTREAM_URL is required/);
+  assert.throws(() => resolveApiUpstreamUrl("http://backend.example.test", "production"), /must use HTTPS/);
+  assert.throws(() => resolveApiUpstreamUrl("https://user:pass@backend.example.test"), /without credentials/);
+  assert.throws(() => resolveApiUpstreamUrl("https://backend.example.test/prefix"), /without credentials/);
+  assert.throws(() => resolveApiUpstreamUrl("https://backend.example.test?next=http://169.254.169.254"), /without credentials/);
 });
 
-test("API base URL preserves deployment configuration and removes trailing slashes", () => {
-  assert.equal(resolveApiBaseUrl("https://api.example.test/service///"), "https://api.example.test/service");
+test("browser API calls are relative and do not expose the server-only origin", async () => {
+  const [client, route, webExample] = await Promise.all([
+    readFile(new URL("./car-api.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/[...path]/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../.env.example", import.meta.url), "utf8"),
+  ]);
+  assert.match(client, /export const API = ""/);
+  assert.match(client, /function sameOriginProxyPath/);
+  assert.match(client, /url\.pathname = url\.pathname\.replace\(\/\\\/\$\//);
+  assert.doesNotMatch(client, /API_UPSTREAM_URL|NEXT_PUBLIC_API_BASE_URL/);
+  assert.match(route, /process\.env\.API_UPSTREAM_URL/);
+  assert.match(route, /Cache-Control.*private, no-store/s);
+  assert.match(webExample, /^API_UPSTREAM_URL=http:\/\/localhost:8000$/m);
+  assert.doesNotMatch(webExample, /^NEXT_PUBLIC_API_BASE_URL=/m);
 });
 
-test("local API and web URLs use one cookie host even when loopback aliases differ", () => {
-  assert.equal(resolveApiBaseUrl("http://127.0.0.1:8000", "http://localhost:3000"), "http://localhost:8000");
-  assert.equal(resolveApiBaseUrl("http://localhost:8000", "http://127.0.0.1:3000"), "http://127.0.0.1:8000");
-  assert.equal(resolveApiBaseUrl("https://api.example.test", "https://www.example.test"), "https://api.example.test");
-});
-
-test("staff login and role dashboard share the configured API client", async () => {
-  const [login, dashboardRoute, dashboard] = await Promise.all([
+test("all staff auth and public enquiry forms use the same-origin API client", async () => {
+  const [login, logout, shell, enquiry] = await Promise.all([
     readFile(new URL("../app/staff/login/page.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../app/staff/page.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../components/role-dashboard.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../components/staff-shell.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../components/staff-shell.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../components/public-enquiry-form.tsx", import.meta.url), "utf8"),
   ]);
   assert.match(login, /import \{ api \} from "@\/lib\/car-api"/);
-  assert.match(dashboardRoute, /RoleDashboard from "@\/components\/role-dashboard"/);
-  assert.match(dashboard, /import \{ api, User \} from "@\/lib\/car-api"/);
-  assert.doesNotMatch(login, /NEXT_PUBLIC_API_BASE_URL/);
-  assert.doesNotMatch(dashboardRoute, /NEXT_PUBLIC_API_BASE_URL/);
-  assert.doesNotMatch(dashboard, /NEXT_PUBLIC_API_BASE_URL/);
+  assert.match(shell, /api<void>\("\/api\/auth\/logout\/"/);
+  assert.match(shell, /api<User>\("\/api\/auth\/me\/"/);
+  assert.match(enquiry, /api<\{reference:string\}>\("\/api\/public\/enquiries\/"/);
+  assert.doesNotMatch([login, logout].join("\n"), /localStorage/);
 });
 
-test("public appointment, enquiry, and quote submissions use the shared API client and retain entries on failure", async () => {
-  const form = await readFile(new URL("../components/public-enquiry-form.tsx", import.meta.url), "utf8");
-  assert.match(form, /import \{ api, Vehicle \} from "@\/lib\/car-api"/);
-  assert.match(form, /api<\{reference:string\}>\("\/api\/public\/enquiries\/"/);
-  assert.doesNotMatch(form, /fetch\(/);
-  assert.match(form, /catch \(e\) \{ setError\(/);
-  assert.match(form, /\{error && <p className="enquiry-error enquiry-wide" role="alert">\{error\}<\/p>\}/);
-  assert.match(form, /value=\{form\.full_name\}/);
-  assert.match(form, /value=\{form\.vehicle_reference\}/);
-  assert.match(form, /value=\{form\.message\}/);
-});
-
-test("public vehicle-list API failures are shown instead of silently becoming an empty selector", async () => {
-  const form = await readFile(new URL("../components/public-enquiry-form.tsx", import.meta.url), "utf8");
-  assert.match(form, /setCarsError\(e instanceof Error \? `Available vehicles could not be loaded\./);
-  assert.match(form, /\{carsError && <span className="enquiry-error" role="alert">\{carsError\}<\/span>\}/);
+test("proxy forwards request bodies, CSRF and cookies, and canonicalizes Django API paths", async () => {
+  const route = await readFile(new URL("../app/api/[...path]/route.ts", import.meta.url), "utf8");
+  for (const header of ["cookie", "origin", "referer", "x-csrftoken", "idempotency-key", "content-type", "range"]) {
+    assert.match(route, new RegExp(`\\"${header}\\"`));
+  }
+  assert.match(route, /body: hasBody \? request\.body : undefined/);
+  assert.match(route, /getSetCookie/);
+  assert.match(route, /always send the canonical API path/);
+  assert.ok(route.includes('new URL(`/api/${path.map(encodeURIComponent).join("/")}/`, upstreamOrigin)'));
+  assert.match(route, /domain\\s\*=/i);
+  assert.match(route, /forwardedProto === "https" \? "https" : "http"/);
 });

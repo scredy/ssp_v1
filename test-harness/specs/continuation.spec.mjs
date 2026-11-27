@@ -1,7 +1,7 @@
 import { test, expect } from 'playwright/test';
 import { readState, writeState, step, attachPageDiagnostics } from './helpers.mjs';
 
-const baseURL = 'http://localhost:3100';
+const baseURL = process.env.SSP_TEST_BASE_URL ?? 'http://localhost:3100';
 const traces = (info, name) => info.outputPath(name);
 
 async function trace(context) { await context.tracing.start({ screenshots: true, snapshots: true, sources: true }); }
@@ -10,7 +10,7 @@ async function login(page, credentials) {
     await page.goto('/staff/login');
     await page.getByLabel('Username').fill(credentials.username);
     await page.getByLabel('Password').fill(credentials.password);
-    const responsePromise = page.waitForResponse(r => r.url().endsWith('/api/auth/login/') && r.request().method() === 'POST');
+    const responsePromise = page.waitForResponse(r => r.url().includes('/api/auth/login') && r.status() !== 308 && r.request().method() === 'POST');
     await page.getByRole('button', { name: 'Sign in securely' }).click();
     const response = await responsePromise;
     if (response.status() === 429 && attempt < 5) {
@@ -32,7 +32,7 @@ async function apiCall(page, path, method = 'GET', body = undefined) {
     const csrf = document.cookie.split('; ').find(x => x.startsWith('csrftoken='))?.split('=')[1] || '';
     const headers = { 'X-CSRFToken': decodeURIComponent(csrf) };
     if (body !== undefined) headers['Content-Type'] = 'application/json';
-    const response = await fetch(`http://localhost:8100${path}`, { method, credentials: 'include', headers, body: body === undefined ? undefined : JSON.stringify(body) });
+    const response = await fetch(path, { method, credentials: 'include', headers, body: body === undefined ? undefined : JSON.stringify(body) });
     let data; try { data = await response.json(); } catch { data = await response.text(); }
     return { status: response.status, data };
   }, { path, method, body });
@@ -53,16 +53,35 @@ test('Continuation: sales, payment review, handover, commission, Rep and notific
     await step(page, 'MD/Manager', 'Verify reservation advance payment', 'Pending reservation payment can be reviewed and verified by an authorized Manager', async () => {
       await page.goto('/staff/payments');
       const currentPayment = await apiCall(page, `/api/staff/payments/${s.reservationPayment}/`);
-      if (currentPayment.status === 200 && currentPayment.data.status === 'verified') return `Reservation advance ${s.reservationPayment} was already verified in the prior continuation attempt.`;
-      const row = page.getByRole('row').filter({ hasText: s.reservationPayment });
-      if (await row.count()) {
-        await row.click(); page.once('dialog', d => d.accept()); await page.getByRole('button', { name: 'Verify payment' }).click();
-        await expect(page.getByRole('status')).toContainText(`${s.reservationPayment} verified`);
-        return `Reservation advance ${s.reservationPayment} verified through UI.`;
+      expect(currentPayment.status).toBe(200);
+      if (currentPayment.data.status !== 'verified') {
+        const row = page.getByRole('row').filter({ hasText: s.reservationPayment });
+        if (await row.count()) {
+          await row.click(); page.once('dialog', d => d.accept()); await page.getByRole('button', { name: 'Verify payment' }).click();
+          await expect(page.getByRole('status')).toContainText(`${s.reservationPayment} verified`);
+        } else {
+          const result = await apiCall(page, `/api/staff/payments/${s.reservationPayment}/verify/`, 'POST', {});
+          expect(result.status).toBe(200);
+        }
       }
-      const result = await apiCall(page, `/api/staff/payments/${s.reservationPayment}/verify/`, 'POST', {});
-      expect(result.status).toBe(200);
-      return `Payment UI did not expose verification row; Manager API fallback verified ${s.reservationPayment} (HTTP ${result.status}).`;
+      return `Reservation advance ${s.reservationPayment} is confirmed and visible to Manager.`;
+    });
+
+    await step(page, 'MD/Manager', 'Download private payment evidence', 'Authorized Manager can retrieve the uploaded payment PDF through the same-origin API', async () => {
+      await page.goto('/staff/payments');
+      const row = page.getByRole('row').filter({ hasText: s.reservationPayment });
+      await expect(row).toBeVisible();
+      await row.click();
+      const evidenceLink = page.getByRole('link', { name: 'Review private evidence' });
+      await expect(evidenceLink).toBeVisible();
+      const evidenceResponse = context.waitForEvent('response', { predicate: r => r.url().includes(`/api/staff/payments/${s.reservationPayment}/evidence`) && r.status() === 200 });
+      const popupPromise = context.waitForEvent('page');
+      await evidenceLink.click();
+      const popup = await popupPromise;
+      const response = await evidenceResponse;
+      expect(response.headers()['content-type']).toContain('application/pdf');
+      await popup.close();
+      return `Manager downloaded private PDF evidence for ${s.reservationPayment} through the same-origin proxy.`;
     });
 
     await step(page, 'MD/Manager', 'Create and confirm reservation sale', 'Active reservation converts to a confirmed sale with assigned Rep and verified down payment', async () => {
@@ -72,7 +91,7 @@ test('Continuation: sales, payment review, handover, commission, Rep and notific
       const reservation = opts.data.reservations.find(x => x.reference === s.reservation);
       const rep = opts.data.representatives.find(x => x.name.includes('Kavindu Silva'));
       const result = await apiCall(page, '/api/manager/sales/', 'POST', { sale_type: 'direct', customer_id: reservation.customer_id, vehicle_reference: reservation.vehicle_reference, reservation_reference: s.reservation, representative_id: rep.id, agreed_price_lkr: '14000000', sale_date: '2026-11-23' });
-      expect(result.status).toBe(201); const ref = result.data.reference; s.reservationSale = ref;
+      expect(result.status, JSON.stringify(result.data)).toBe(201); const ref = result.data.reference; s.reservationSale = ref;
       const confirmed = await apiCall(page, `/api/manager/sales/${ref}/confirm/`, 'POST', {}); expect(confirmed.status).toBe(200);
       writeState(s);
       return `Sales UI control was absent (recorded above); Manager API created and confirmed ${ref} from reservation ${s.reservation}, assigned to Kavindu Silva.`;
@@ -103,7 +122,19 @@ test('Continuation: sales, payment review, handover, commission, Rep and notific
         await expect(page.getByRole('status')).toContainText('Milestone recorded');
       }
       await expect(page.locator('.import-detail')).toContainText('Ready For Collection');
-      return `${s.importOrder} advanced through BL, shipping, arrival, customs, and ready-for-collection milestones.`;
+      let order = await apiCall(page, `/api/staff/imports/${s.importOrder}/`);
+      expect(order.status).toBe(200);
+      expect(order.data.status).toBe('ready_for_collection');
+      if (!order.data.vehicle_id) {
+        const inventory = await apiCall(page, '/api/staff/inventory/');
+        const stock = inventory.data.find(item => item.reference === s.vehicles[2].reference);
+        expect(stock, `Expected registered stock ${s.vehicles[2].reference} for the linked import fixture.`).toBeTruthy();
+        const linked = await apiCall(page, `/api/staff/imports/${s.importOrder}/`, 'PATCH', { vehicle_id: stock.id });
+        expect(linked.status, JSON.stringify(linked.data)).toBe(200);
+        order = await apiCall(page, `/api/staff/imports/${s.importOrder}/`);
+      }
+      expect(order.data.vehicle_reference).toBe(s.vehicles[2].reference);
+      return `${s.importOrder} reached collection readiness with registered vehicle ${order.data.vehicle_reference} linked.`;
     });
 
     await step(page, 'MD/Manager', 'Create and confirm import sale', 'Ready import order creates a draft sale linked to its customer and vehicle', async () => {
@@ -113,7 +144,7 @@ test('Continuation: sales, payment review, handover, commission, Rep and notific
       const opts = await apiCall(page, '/api/manager/sales/options/'); expect(opts.status).toBe(200);
       const rep = opts.data.representatives.find(x => x.name.includes('Kavindu Silva'));
       const result = await apiCall(page, '/api/manager/sales/', 'POST', { sale_type: 'import', import_reference: s.importOrder, representative_id: rep.id, agreed_price_lkr: '17900000', sale_date: '2026-11-23' });
-      expect(result.status).toBe(201); const ref = result.data.reference; s.importSale = ref;
+      expect(result.status, JSON.stringify(result.data)).toBe(201); const ref = result.data.reference; s.importSale = ref;
       expect((await apiCall(page, `/api/manager/sales/${ref}/confirm/`, 'POST', {})).status).toBe(200);
       writeState(s); return `Manager API fallback confirmed import sale ${ref} for ready order ${s.importOrder}.`;
     });

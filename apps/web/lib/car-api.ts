@@ -1,9 +1,6 @@
-import { resolveApiBaseUrl } from "./api-config.mjs";
-
-export const API = resolveApiBaseUrl(
-  process.env.NEXT_PUBLIC_API_BASE_URL,
-  typeof window === "undefined" ? undefined : window.location.origin,
-);
+// All browser API traffic stays on this origin and is forwarded by the
+// server-only Next.js Route Handler. The Django URL is never bundled to clients.
+export const API = "";
 
 export type Photo = { id: number; url: string; content_type: string; created_at: string };
 export type Vehicle = {
@@ -19,16 +16,23 @@ function csrfToken() {
   return document.cookie.split("; ").find((item) => item.startsWith("csrftoken="))?.split("=")[1] ?? "";
 }
 
-export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
-  if (!API) {
-    throw new Error("The SSP service is not configured. Set NEXT_PUBLIC_API_BASE_URL and restart the web server.");
+function sameOriginProxyPath(path: string) {
+  const url = new URL(path, "http://ssp.local");
+  if (url.origin !== "http://ssp.local" || !url.pathname.startsWith("/api/")) {
+    throw new Error("API requests must use a same-origin /api/ path.");
   }
+  url.pathname = url.pathname.replace(/\/$/, "");
+  return `${url.pathname}${url.search}${url.hash}`;
+}
+
+export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const proxyPath = sameOriginProxyPath(path);
   const method = (init.method ?? "GET").toUpperCase();
   const headers = new Headers(init.headers);
   if (method !== "GET" && method !== "HEAD") {
     let csrfResponse: Response;
     try {
-      csrfResponse = await fetch(`${API}/api/auth/csrf/`, { credentials: "include" });
+      csrfResponse = await fetch(sameOriginProxyPath("/api/auth/csrf/"), { credentials: "include" });
     } catch {
       throw new Error("The SSP service is unavailable right now. Please check your connection and try again.");
     }
@@ -42,7 +46,7 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   }
   let response: Response;
   try {
-    response = await fetch(`${API}${path}`, { ...init, method, headers, credentials: "include" });
+    response = await fetch(`${API}${proxyPath}`, { ...init, method, headers, credentials: "include" });
   } catch {
     throw new Error("The SSP service is unavailable right now. Please check your connection and try again.");
   }

@@ -1,5 +1,6 @@
 """File-only mail backend for acceptance tests; no SMTP or external delivery."""
 from pathlib import Path
+import os
 from uuid import uuid4
 
 from django.core.mail.backends.base import BaseEmailBackend
@@ -7,7 +8,7 @@ from django.core.mail.backends.base import BaseEmailBackend
 
 class FileEmailBackend(BaseEmailBackend):
     def send_messages(self, email_messages):
-        output = Path(__file__).resolve().parent / "artifacts" / "emails"
+        output = Path(os.environ.get("SSP_TEST_EMAIL_DIR", Path(__file__).resolve().parent / "artifacts" / "emails"))
         output.mkdir(parents=True, exist_ok=True)
         sent = 0
         for message in email_messages:

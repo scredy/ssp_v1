@@ -2,25 +2,69 @@ import { test, expect } from 'playwright/test';
 import { resolve } from 'node:path';
 import { readEnvFile, readState, writeState, newPassword, listEmails, invitationLink, step, attachPageDiagnostics, resetSteps, artifacts } from './helpers.mjs';
 
-const baseURL = 'http://localhost:3100';
+const baseURL = process.env.SSP_TEST_BASE_URL ?? 'http://localhost:3100';
 const testInfoOutput = (info, filename) => info.outputPath(filename);
+
+async function futureColomboDateTime(page, daysAhead = 5) {
+  return page.evaluate((days) => {
+    const date = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
+    const parts = Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Colombo', year: 'numeric', month: '2-digit', day: '2-digit',
+    }).formatToParts(date).map(({ type, value }) => [type, value]));
+    return `${parts.year}-${parts.month}-${parts.day}T11:30`;
+  }, daysAhead);
+}
 
 async function startTrace(context) {
   await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
 }
 
 async function login(page, role, credentials) {
-  await page.goto('/staff/login');
-  await page.getByLabel('Username').fill(credentials.username);
-  await page.getByLabel('Password').fill(credentials.password);
-  await page.getByRole('button', { name: 'Sign in securely' }).click();
+  let csrfResponse; let loginResponse;
+  for (let attempt = 0; attempt < 6; attempt++) {
+    await page.goto('/staff/login');
+    await page.getByLabel('Username').fill(credentials.username);
+    await page.getByLabel('Password').fill(credentials.password);
+    const csrfResponsePromise = page.waitForResponse(response => response.url().includes('/api/auth/csrf') && response.request().method() === 'GET');
+    const loginResponsePromise = page.waitForResponse(response => response.url().includes('/api/auth/login') && response.request().method() === 'POST');
+    await page.getByRole('button', { name: 'Sign in securely' }).click();
+    csrfResponse = await csrfResponsePromise;
+    loginResponse = await loginResponsePromise;
+    if (loginResponse.status() !== 429) break;
+    const message = await loginResponse.text();
+    const seconds = Number(message.match(/available in (\d+) second/)?.[1] || 2);
+    await page.waitForTimeout((seconds + 1) * 1000);
+    if (attempt === 5) throw new Error('Login remained rate limited after retries.');
+  }
+  const csrfCookies = (await csrfResponse.headersArray()).filter(header => header.name.toLowerCase() === 'set-cookie').map(header => header.value);
+  const csrfCookie = csrfCookies.find(cookie => cookie.toLowerCase().startsWith('csrftoken='));
+  expect(csrfResponse.status()).toBe(200);
+  expect(csrfCookie).toMatch(/;\s*Secure/i);
+  expect(csrfCookie).toMatch(/SameSite=Lax/i);
+  expect(csrfCookie).not.toMatch(/;\s*Domain=/i);
+  expect(loginResponse.status()).toBe(200);
+  const sessionCookies = (await loginResponse.headersArray()).filter(header => header.name.toLowerCase() === 'set-cookie').map(header => header.value);
+  const sessionCookie = sessionCookies.find(cookie => cookie.toLowerCase().startsWith('sessionid='));
+  expect(sessionCookie).toMatch(/;\s*HttpOnly/i);
+  expect(sessionCookie).toMatch(/;\s*Secure/i);
+  expect(sessionCookie).toMatch(/SameSite=Lax/i);
+  expect(sessionCookie).not.toMatch(/;\s*Domain=/i);
   await page.waitForURL('**/staff', { timeout: 12000 });
+  await expect(page.getByText(role, { exact: false }).first()).toBeVisible();
+  await page.reload();
   await expect(page.getByText(role, { exact: false }).first()).toBeVisible();
 }
 
 async function logout(page) {
   const button = page.getByRole('button', { name: 'Sign out' });
-  if (await button.count()) await button.click();
+  if (await button.count()) {
+    const responsePromise = page.waitForResponse(response => response.url().includes('/api/auth/logout') && response.request().method() === 'POST');
+    await button.click();
+    const response = await responsePromise;
+    expect(response.status()).toBe(204);
+    await page.goto('/staff/accounts');
+    await expect(page).toHaveURL(/\/staff\/login/);
+  }
 }
 
 async function selectOptionContaining(select, text) {
@@ -142,7 +186,7 @@ test('Admin onboarding, invitations, password setup/reset, and audit', async ({ 
       }
     } else {
       await step(page, 'Admin', 'Locate generated reset message', 'A local-only reset link is available for the Staff account', async () => {
-        throw new Error('No reset-password link was found in test-harness/artifacts/emails.');
+        throw new Error('No reset-password link was found in the configured acceptance email folder.');
       });
     }
 
@@ -151,6 +195,11 @@ test('Admin onboarding, invitations, password setup/reset, and audit', async ({ 
       await expect(page.getByRole('heading', { name: /Recent account activity/i })).toBeVisible();
       await expect(page.getByText('Account Invitation Sent').first()).toBeVisible();
       return 'Recent activity screen rendered invitation, authentication, and reset events.';
+    });
+
+    await step(page, 'Admin', 'Confirm logout clears the authenticated session', 'Logout succeeds and a protected route redirects to sign-in', async () => {
+      await logout(page);
+      return 'Logged out successfully; protected Accounts route returned to sign-in.';
     });
 
     writeState(state);
@@ -205,6 +254,7 @@ test('Staff inventory and public customer journey', async ({ browser }, info) =>
         await form.getByLabel('Asking price (LKR)').fill(car.price);
         await form.getByLabel('Publication').selectOption('draft');
         await form.getByLabel('Description').fill('Fictional acceptance-test vehicle; no customer data.');
+        if (car.make === 'Honda') await form.getByLabel('Add photographs').setInputFiles(resolve(artifacts, 'vehicle-photo.png'));
         await form.getByRole('button', { name: 'Create vehicle' }).click();
         await expect(page.getByRole('status')).toContainText('Saved SSP-');
         const row = page.getByRole('row').filter({ hasText: car.model });
@@ -229,6 +279,15 @@ test('Staff inventory and public customer journey', async ({ browser }, info) =>
       return 'Published Honda is visible; private stock identifier is absent from public page.';
     });
 
+    await step(page, 'Public visitor', 'Open dynamic vehicle detail page', 'Published vehicle detail resolves by its public reference', async () => {
+      await page.goto(`/cars/${vehicles[0].reference}`);
+      await expect(page.getByRole('heading', { name: /Honda Civic e:HEV/ })).toBeVisible();
+      const photo = page.locator('.vehicle-main-photo img');
+      await expect(photo).toBeVisible();
+      await expect.poll(() => photo.evaluate(image => image.complete && image.naturalWidth > 0)).toBeTruthy();
+      return `Public vehicle detail for ${vehicles[0].reference} loaded.`;
+    });
+
     await step(page, 'Public visitor', 'Submit showroom test-drive request', 'Visitor sees request reference and no confirmed-booking claim', async () => {
       await page.goto('/book-appointment');
       await page.getByLabel('Full name *').fill('Elena Wickramasinghe');
@@ -236,7 +295,7 @@ test('Staff inventory and public customer journey', async ({ browser }, info) =>
       await page.getByLabel('Email *').fill('elena.wickramasinghe@example.com');
       await page.getByLabel('Purpose *').selectOption('test_drive');
       await page.getByLabel('Vehicle (optional)').selectOption(vehicles[0].reference);
-      await page.getByLabel('Preferred date and time *').fill('2026-11-25T11:30');
+      await page.getByLabel('Preferred date and time *').fill(await futureColomboDateTime(page));
       await page.getByLabel('Additional notes').fill('Fictional acceptance request for a test drive.');
       await page.getByRole('button', { name: 'Submit request' }).click();
       await expect(page.getByRole('status')).toContainText('REQUEST RECEIVED');
@@ -266,11 +325,11 @@ test('Staff inventory and public customer journey', async ({ browser }, info) =>
       await detail.getByLabel('Status').selectOption('contacted');
       await detail.getByLabel('Staff-only notes').fill('Called using fictional contact; confirmed follow-up.');
       await detail.getByRole('button', { name: /save/i }).click();
-      await expect(page.getByRole('status')).toContainText('Saved update');
+      await expect(page.locator('.enquiry-success-message')).toContainText('Saved update');
       await detail.getByLabel('Status').selectOption('scheduled');
-      await detail.getByLabel('Confirmed date and time').fill('2026-11-25T11:30');
+      await detail.getByLabel('Confirmed date and time').fill(await futureColomboDateTime(page));
       await detail.getByRole('button', { name: /save/i }).click();
-      await expect(page.getByRole('status')).toContainText('Saved update');
+      await expect(page.locator('.enquiry-success-message')).toContainText('Saved update');
       return 'Staff note saved; request progressed through Contacted to Scheduled with a confirmed time.';
     });
 
@@ -326,7 +385,7 @@ test('Staff reservations, payments, imports, tracking, and notifications', async
         if (!(await createButton.isVisible())) throw new Error('New reservation control is hidden for Staff on /staff/reservations; inventory offers a Reserve link.');
         return 'New reservation control is visible.';
       }, { continueOnFailure: true });
-      await step(page, 'Staff', 'Create reservation and record unverified declared advance', 'Reservation is created, Rep is assigned, and declared advance is explicitly unverified', async () => {
+      await step(page, 'Staff', 'Create reservation and record unverified declared advance', 'Reservation is created and declared advance is explicitly unverified', async () => {
         await page.goto('/staff/inventory');
         const row = page.getByRole('row').filter({ hasText: state.vehicles[0].model });
         await row.getByRole('link', { name: 'Reserve' }).click();
@@ -335,7 +394,6 @@ test('Staff reservations, payments, imports, tracking, and notifications', async
         const selects = form.locator('select');
         await selectOptionContaining(selects.nth(0), 'Elena Wickramasinghe');
         await selectOptionContaining(selects.nth(1), state.vehicles[0].reference);
-        await selectOptionContaining(selects.nth(2), 'Kavindu Silva');
         await form.getByLabel('Agreed price (LKR) *').fill('14000000');
         await form.getByLabel('Advance amount (LKR)').fill('1000000');
         await form.getByLabel('Staff notes').fill('Fictional reservation for acceptance walkthrough.');
@@ -350,20 +408,36 @@ test('Staff reservations, payments, imports, tracking, and notifications', async
     }
 
     if (!state.reservationPayment) {
-      await step(page, 'Staff', 'Record reservation advance payment', 'Payment is pending verification and appears in the reservation balance workflow', async () => {
+      await step(page, 'MD/Manager', 'Record reservation advance payment', 'Manager records payment through the authorized reservation payment panel', async () => {
+        await logout(page);
+        await login(page, 'MD/Manager', state.manager);
+        await page.goto('/staff/reservations');
+        await page.getByRole('row').filter({ hasText: state.reservation }).click();
         await page.getByRole('link', { name: 'Record payment' }).click();
         await expect(page).toHaveURL(/\/staff\/payments\?target_type=reservation/);
         const form = page.locator('form.payment-form');
-        await form.getByLabel('Amount (LKR) *').fill('1000000');
+        await form.getByLabel('Reservation reference *').fill(state.reservation);
+        await form.getByRole('button', { name: 'Check balance' }).click();
+        await expect(form.locator('.payment-settlement-preview')).toContainText('Outstanding balance');
+        await form.getByLabel('Payment amount (LKR) *').fill('1000000');
         await form.getByLabel('Payment method *').selectOption('bank_transfer');
+        await form.getByLabel('I confirm these funds have been received and cleared *').check();
         await form.getByLabel('Payment date *').fill(new Date().toISOString().slice(0, 10));
         await form.getByLabel('Transaction reference').fill('PW-ADV-RESERVATION-01');
+        await form.getByLabel('Receipt / evidence').setInputFiles({
+          name: 'bank-transfer-evidence.pdf',
+          mimeType: 'application/pdf',
+          buffer: Buffer.from('%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF'),
+        });
         await form.getByLabel('Staff notes').fill('Fictional bank transfer for acceptance testing.');
-        await form.getByRole('button', { name: 'Record payment' }).click();
+        await form.getByRole('button', { name: 'Confirm & Record Payment' }).click();
+        await page.getByRole('dialog').getByRole('button', { name: 'Confirm & Record Payment' }).click();
         const notice = page.getByRole('status');
-        await expect(notice).toContainText('recorded as pending verification');
+        await expect(notice).toContainText('was confirmed and recorded');
         state.reservationPayment = (await notice.innerText()).match(/PAY-[A-Z0-9-]+/)?.[0];
-        return `Payment ${state.reservationPayment} recorded as pending.`;
+        await logout(page);
+        await login(page, 'Staff', state.staff);
+        return `Manager recorded confirmed payment ${state.reservationPayment} with private PDF evidence.`;
       });
       writeState(state);
     }
@@ -371,7 +445,7 @@ test('Staff reservations, payments, imports, tracking, and notifications', async
     await step(page, 'Staff', 'Review staff notifications and read-state control', 'Staff receives workflow inbox updates and can mark an item read', async () => {
       await page.goto('/staff/notifications');
       await expect(page.getByRole('heading', { name: 'Notifications', exact: true }).first()).toBeVisible();
-      await expect(page.locator('.notification-summary')).toContainText(/unread notifications?/);
+      await expect(page.locator('.notification-hero-count')).toContainText(/unread notifications?/);
       const firstNotification = page.locator('.notification-card').first();
       if (await firstNotification.count()) {
         const title = await firstNotification.locator('h2').innerText();
@@ -557,8 +631,9 @@ test('CEO BL approval, commission policy, and Manager oversight', async ({ brows
     await step(page, 'CEO', 'Review MD/Manager oversight', 'CEO can view activity attributed to current MD/Manager actors', async () => {
       await page.goto('/staff/oversight/managers');
       await expect(page.getByRole('heading', { name: 'Leadership oversight' })).toBeVisible();
-      await expect(page.getByText(/Representative profile linked/i)).toBeVisible();
-      return 'Leadership oversight shows Manager activity.';
+      await expect(page.locator('.workspace-hero')).toContainText('MD/Manager activity');
+      await expect(page.getByRole('button', { name: 'Apply filters' })).toBeVisible();
+      return 'CEO leadership oversight view and Manager activity filters loaded.';
     });
 
     await step(page, 'CEO', 'Check read-only sales permissions', 'CEO can inspect sales but cannot create or confirm them', async () => {

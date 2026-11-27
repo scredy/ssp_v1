@@ -43,10 +43,19 @@ ALLOWED_HOSTS = _get_allowed_hosts()
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
-    "handlers": {"console": {"class": "logging.StreamHandler"}},
+    "filters": {"safe_csrf": {"()": "accounts.security.SafeCsrfLogFilter"}},
+    "handlers": {
+        "console": {"class": "logging.StreamHandler"},
+        "csrf_console": {"class": "logging.StreamHandler", "filters": ["safe_csrf"]},
+    },
     "loggers": {
         "django.security.DisallowedHost": {
             "handlers": ["console"],
+            "level": "WARNING",
+            "propagate": False,
+        },
+        "django.security.csrf": {
+            "handlers": ["csrf_console"],
             "level": "WARNING",
             "propagate": False,
         },
@@ -126,7 +135,9 @@ SESSION_COOKIE_SAMESITE = "Lax"
 CSRF_COOKIE_HTTPONLY = False  # The same-origin web client reads this to send X-CSRFToken.
 CSRF_COOKIE_SECURE = not DEBUG
 CSRF_COOKIE_SAMESITE = "Lax"
-CSRF_COOKIE_DOMAIN = os.environ.get("CSRF_COOKIE_DOMAIN") or None
+# The reverse proxy returns host-only CSRF cookies on the frontend origin.
+# Never share authentication cookies across Render subdomains.
+CSRF_COOKIE_DOMAIN = None
 CSRF_TRUSTED_ORIGINS = [origin.strip() for origin in os.environ.get(
     "CSRF_TRUSTED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
 ).split(",") if origin.strip()]
@@ -181,5 +192,6 @@ if not DEBUG:
             "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
         },
     }
+CSRF_FAILURE_VIEW = "accounts.security.csrf_failure"
 DATA_UPLOAD_MAX_NUMBER_FILES = 10
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"

@@ -1,1 +1,1 @@
-export function resolveApiBaseUrl(configuredUrl: string | undefined, webOrigin?: string): string;
+export function resolveApiUpstreamUrl(configuredUrl: string | undefined, nodeEnv?: string): string;
