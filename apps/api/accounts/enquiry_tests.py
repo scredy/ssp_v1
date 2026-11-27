@@ -257,7 +257,7 @@ class EnquiryApiTests(APITestCase):
         failed = self.make_appointment()
         failed_time = timezone.now() + timedelta(days=5)
         with patch(
-            "accounts.appointment_email.send_mail", side_effect=RuntimeError("credential must not be persisted")
+            "accounts.appointment_email.send_customer_email", side_effect=RuntimeError("credential must not be persisted")
         ), self.captureOnCommitCallbacks(execute=True):
             failure_response = self.schedule_enquiry(failed, failed_time)
         self.assertEqual(failure_response.status_code, status.HTTP_200_OK)

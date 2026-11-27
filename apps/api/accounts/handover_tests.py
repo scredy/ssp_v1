@@ -75,6 +75,179 @@ class HandoverApiTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         return response.data
 
+    def test_completion_email_sent_once(self):
+        from django.core import mail
+        from django.test import override_settings
+        from .models import HandoverCompletionEmail
+        from .handover_email import send_handover_email
+
+        with override_settings(
+            EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend"
+        ):
+            handover = self.ceo_approved_handover()
+            detail = f"/api/staff/handovers/{handover['reference']}/"
+
+            self.assertFalse(HandoverCompletionEmail.objects.exists())
+
+            self.client.force_authenticate(self.manager)
+
+            with self.captureOnCommitCallbacks(execute=True):
+                result = self.client.post(
+                    f"{detail}finalize/", {}, format="json"
+                )
+                self.assertEqual(result.status_code, 200)
+
+            record = HandoverCompletionEmail.objects.get(
+                handover_id=handover["id"]
+            )
+
+            self.assertEqual(record.status, "sent", record.error)
+            self.assertIsNotNone(record.sent_at)
+            self.assertEqual(len(mail.outbox), 1)
+            self.assertEqual(mail.outbox[0].to, [self.customer.email])
+            self.assertIn("Vehicle Handover Completed", mail.outbox[0].subject)
+            self.assertIn(handover["reference"], mail.outbox[0].body)
+            self.assertTrue(mail.outbox[0].alternatives)
+
+            send_handover_email(record.pk, self.manager.pk)
+
+            self.assertEqual(len(mail.outbox), 1)
+
+            retry = self.client.post(
+                f"{detail}retry-email/", {}, format="json"
+            )
+            self.assertEqual(retry.status_code, 409)
+
+            self.assertEqual(
+                self.client.get(detail).data["completion_email"]["status"],
+                "sent"
+            )
+
+            self.assertTrue(AuditEvent.objects.filter(
+                action="handover.completion_email",
+                subject=handover["reference"],
+            ).exists())
+
+    def test_completion_email_failure_does_not_reverse_handover(self):
+        from unittest.mock import patch
+        from .models import HandoverCompletionEmail
+
+        handover = self.ceo_approved_handover()
+        detail = f"/api/staff/handovers/{handover['reference']}/"
+
+        self.client.force_authenticate(self.manager)
+
+        with patch(
+            "accounts.handover_email.send_customer_email",
+            side_effect=RuntimeError("Simulated mail failure")
+        ):
+            with self.captureOnCommitCallbacks(execute=True):
+                result = self.client.post(
+                    f"{detail}finalize/", {}, format="json"
+                )
+                self.assertEqual(result.status_code, 200)
+
+        record = HandoverCompletionEmail.objects.get(
+            handover_id=handover["id"]
+        )
+
+        self.assertEqual(record.status, "failed")
+        self.assertEqual(record.handover.status, Handover.Status.FINALIZED)
+
+        self.vehicle.refresh_from_db()
+        self.assertEqual(self.vehicle.status, Vehicle.Status.HANDED_OVER)
+
+        unconfirmed = self.client.post(
+            f"{detail}retry-email/", {}, format="json"
+        )
+        self.assertEqual(unconfirmed.status_code, 400)
+
+        for user in (self.staff, self.rep, self.admin):
+            self.client.force_authenticate(user)
+            denied = self.client.post(
+                f"{detail}retry-email/",
+                {"confirmed_not_accepted": True},
+                format="json"
+            )
+            self.assertEqual(denied.status_code, 403)
+
+        self.client.force_authenticate(self.ceo)
+
+        with patch(
+            "accounts.handover_email.send_customer_email",
+            return_value=1
+        ) as send:
+            with self.captureOnCommitCallbacks(execute=True):
+                retry = self.client.post(
+                    f"{detail}retry-email/",
+                    {"confirmed_not_accepted": True},
+                    format="json"
+                )
+                self.assertEqual(retry.status_code, 200)
+
+            send.assert_called_once()
+
+        record.refresh_from_db()
+        self.assertEqual(record.status, "sent")
+
+        self.assertEqual(HandoverCompletionEmail.objects.filter(
+            handover_id=handover["id"]
+        ).count(), 1)
+
+    def test_completion_email_missing_address(self):
+        from unittest.mock import patch
+        from .models import HandoverCompletionEmail
+
+        self.customer.email = ""
+        self.customer.save(update_fields=["email"])
+
+        handover = self.ceo_approved_handover()
+        detail = f"/api/staff/handovers/{handover['reference']}/"
+
+        self.client.force_authenticate(self.manager)
+
+        with patch(
+            "accounts.handover_email.send_customer_email"
+        ) as send:
+            with self.captureOnCommitCallbacks(execute=True):
+                result = self.client.post(
+                    f"{detail}finalize/", {}, format="json"
+                )
+                self.assertEqual(result.status_code, 200)
+
+            send.assert_not_called()
+
+        record = HandoverCompletionEmail.objects.get(
+            handover_id=handover["id"]
+        )
+
+        self.assertEqual(record.status, "no_email")
+
+        retry = self.client.post(
+            f"{detail}retry-email/", {}, format="json"
+        )
+        self.assertEqual(retry.status_code, 400)
+
+        self.customer.email = "corrected@example.test"
+        self.customer.save(update_fields=["email"])
+
+        with patch(
+            "accounts.handover_email.send_customer_email",
+            return_value=1
+        ) as send:
+            with self.captureOnCommitCallbacks(execute=True):
+                retry = self.client.post(
+                    f"{detail}retry-email/", {}, format="json"
+                )
+                self.assertEqual(retry.status_code, 200)
+
+            send.assert_called_once()
+
+        record.refresh_from_db()
+        self.assertEqual(record.status, "sent")
+        self.assertEqual(record.recipient, "corrected@example.test")
+
+
     def test_verified_reservation_down_payment_release_document_receipt_and_later_finance_settlement(self):
         vehicle = self.make_vehicle("FINANCE")
         vehicle.status = Vehicle.Status.RESERVED

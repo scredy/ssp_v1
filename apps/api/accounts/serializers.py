@@ -833,6 +833,7 @@ class HandoverSerializer(serializers.ModelSerializer):
     evidence_url = serializers.SerializerMethodField()
     financial_summary = serializers.SerializerMethodField()
     document_receipt = serializers.SerializerMethodField()
+    completion_email = serializers.SerializerMethodField()
     commission_eligible = serializers.BooleanField(read_only=True)
 
     class Meta:
@@ -841,7 +842,7 @@ class HandoverSerializer(serializers.ModelSerializer):
                   "status", "delivery_date", "vehicle_condition_checklist", "keys_documents_checklist", "customer_acknowledgement",
                   "customer_acknowledged_at", "evidence_attached", "evidence_url", "internal_notes", "prepared_by_name",
                   "created_at", "updated_at", "md_approved_by_name", "md_approved_at", "ceo_approved_by_name", "ceo_approved_at",
-                  "approval_history", "finalized_by_name", "finalized_at", "financial_summary", "commission_eligible", "document_receipt")
+                  "approval_history", "finalized_by_name", "finalized_at", "financial_summary", "commission_eligible", "document_receipt", "completion_email")
         read_only_fields = fields
 
     def get_vehicle_name(self, obj):
@@ -857,6 +858,25 @@ class HandoverSerializer(serializers.ModelSerializer):
         summary = sale_payment_summary(obj.sale)
         summary["balance_review_required"] = summary["outstanding_balance_lkr"] > 0
         return summary
+
+    def get_completion_email(self, obj):
+        from .models import HandoverCompletionEmail
+
+        if obj.status != Handover.Status.FINALIZED:
+            return None
+
+        record = HandoverCompletionEmail.objects.filter(
+            handover_id=obj.pk
+        ).first()
+
+        if record is None:
+            return None
+
+        return {
+            "status": record.status,
+            "sent_at": record.sent_at,
+            "error": record.error,
+        }
 
     def get_document_receipt(self, obj):
         receipt = getattr(obj, "document_receipt", None)

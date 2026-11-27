@@ -939,3 +939,29 @@ class ImportTrackingAccess(models.Model):
 
     def check_pin(self, pin):
         return self.active and check_password(pin, self.pin_hash)
+
+
+class HandoverCompletionEmail(models.Model):
+    class Status(models.TextChoices):
+        NO_EMAIL = "no_email", "No email address"
+        QUEUED = "queued", "Queued"
+        SENDING = "sending", "Sending"
+        SENT = "sent", "Accepted by mail service"
+        FAILED = "failed", "Failed"
+
+    handover = models.OneToOneField(
+        Handover,
+        on_delete=models.PROTECT,
+        related_name="completion_email",
+    )
+    recipient = models.EmailField(blank=True)
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.QUEUED,
+        db_index=True,
+    )
+    sent_at = models.DateTimeField(null=True, blank=True)
+    error = models.CharField(max_length=500, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)

@@ -36,6 +36,8 @@ from .models import (AccountActionToken, AuditEvent, BLApprovalRequest, Commissi
                      ImportTrackingAccess, Notification, Payment, Quotation, RepresentativeProfile, Reservation, Sale,
                      User, Vehicle, VehiclePhoto)
 from .appointment_email import queue_confirmation_email, send_confirmation_email, valid_customer_email
+from .customer_email import enquiry_received_email
+from .handover_email import queue_handover_email, send_handover_email
 from .permissions import CommissionLedgerAccess, CustomerAccess, HasCapability, HandoverAccess, ImportAccess, InventoryAccess, PaymentAccess, QuotationAccess, RepresentativeDirectoryAccess, ReservationAccess, SalesAccess
 from .serializers import (AccountSerializer, AccountSummarySerializer, AccountUpdateSerializer, CurrentUserSerializer,
                           NotificationReadSerializer, NotificationSerializer, PasswordResetRequestSerializer, PasswordSetupSerializer,
@@ -187,17 +189,7 @@ class PublicEnquiryView(APIView):
                 raise
             return Response({"reference": existing.reference, "status": existing.status}, status=status.HTTP_200_OK)
         if email:
-            requested = timezone.localtime(enquiry.requested_at).strftime("%A, %d %B %Y at %I:%M %p") if enquiry.requested_at else ""
-            purpose = enquiry.get_kind_display().lower()
-            requested_line = f"Your preferred time: {requested} Sri Lanka time.\n" if requested else ""
-            send_mail(
-                f"SSP {purpose} request received ({enquiry.reference})",
-                f"Hello {customer.full_name},\n\nWe received your {purpose}. This is a request, not a confirmed booking. "
-                f"Our team will contact you to confirm availability.\n{requested_line}\nReference: {enquiry.reference}\n\nSSP Motor Trading",
-                settings.DEFAULT_FROM_EMAIL,
-                [email],
-                fail_silently=True,
-            )
+            enquiry_received_email(enquiry, email)
         return Response({"reference": enquiry.reference, "status": enquiry.status}, status=status.HTTP_201_CREATED)
 
 
@@ -1632,10 +1624,101 @@ class HandoverFinalizeView(APIView):
                              "balance_review_required": financial_summary["balance_review_required"],
                              "status_before": before, "status_after": handover.status})
                 notify_handover_outcome(handover, "finalized", request.user, event.pk)
+                queue_handover_email(handover, request.user.pk)
         except Handover.DoesNotExist:
             return Response({"detail": "Handover not found."}, status=status.HTTP_404_NOT_FOUND)
         except (Sale.DoesNotExist, Vehicle.DoesNotExist):
             return Response({"detail": "The linked sale or vehicle record was not found."}, status=status.HTTP_409_CONFLICT)
+        return Response(HandoverSerializer(handover).data)
+
+
+class HandoverEmailRetryView(APIView):
+    permission_classes = [HandoverAccess]
+    handover_action = "retry_completion_email"
+
+    def post(self, request, reference):
+        from .models import HandoverCompletionEmail
+
+        with transaction.atomic():
+            handover = get_object_or_404(
+                Handover.objects.select_for_update(),
+                reference=reference,
+            )
+
+            if handover.status != Handover.Status.FINALIZED:
+                return Response(
+                    {"detail": "Only finalized handovers can send completion emails."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            record = HandoverCompletionEmail.objects.select_for_update().filter(
+                handover=handover
+            ).first()
+
+            if record is None:
+                return Response(
+                    {"detail": "No existing email delivery record."},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            allowed = {
+                HandoverCompletionEmail.Status.NO_EMAIL,
+                HandoverCompletionEmail.Status.FAILED,
+                HandoverCompletionEmail.Status.QUEUED,
+            }
+
+            if record.status not in allowed:
+                return Response(
+                    {"detail": "Sent or currently sending emails cannot be retried."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            previous_status = record.status
+
+            if previous_status == HandoverCompletionEmail.Status.FAILED:
+                if request.data.get("confirmed_not_accepted") is not True:
+                    return Response(
+                        {"detail": "Confirm with the mail provider that the previous email was not accepted before retrying."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+            recipient = valid_customer_email(
+                record.recipient
+                if previous_status == HandoverCompletionEmail.Status.QUEUED
+                else handover.customer.email
+            )
+
+            if not recipient:
+                return Response(
+                    {"detail": "The customer does not have a valid email address."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            record.recipient = recipient
+            record.status = HandoverCompletionEmail.Status.QUEUED
+            record.error = ""
+            record.sent_at = None
+
+            record.save(update_fields=[
+                "recipient", "status", "error",
+                "sent_at", "updated_at",
+            ])
+
+            AuditEvent.objects.create(
+                actor=request.user,
+                action="handover.completion_email_retry_requested",
+                subject=handover.reference,
+                details={"previous_status": previous_status},
+            )
+
+            record_id = record.pk
+            actor_id = request.user.pk
+
+            transaction.on_commit(
+                lambda: send_handover_email(record_id, actor_id),
+                robust=True,
+            )
+
         return Response(HandoverSerializer(handover).data)
 
 

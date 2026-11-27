@@ -11,7 +11,13 @@ type DocumentReceipt = { reference: string; issued_at: string; issued_by_name: s
 type EligibleSale = { reference: string; vehicle_reference: string; vehicle_name: string; customer_name: string; agreed_price_lkr: string };
 type HandoverStatus = "preparing" | "pending_md_review" | "pending_ceo_approval" | "ceo_approved" | "finalized";
 type Approval = { reviewer_name: string; reviewer_role: string; decision: string; status_before: string; status_after: string; comments: string; created_at: string };
-type Handover = { id: number; reference: string; sale_reference: string; customer_name: string; vehicle_reference: string; vehicle_name: string; status: HandoverStatus; delivery_date: string | null; vehicle_condition_checklist: Checklist; keys_documents_checklist: Checklist; customer_acknowledgement: string; customer_acknowledged_at: string | null; evidence_attached: boolean; evidence_url: string | null; document_receipt: DocumentReceipt | null; internal_notes: string; prepared_by_name: string; created_at: string; updated_at: string; md_approved_by_name: string | null; md_approved_at: string | null; ceo_approved_by_name: string | null; ceo_approved_at: string | null; approval_history: Approval[]; finalized_by_name: string | null; finalized_at: string | null; financial_summary: FinancialSummary; commission_eligible: boolean };
+type CompletionEmail = {
+  status: "no_email" | "queued" | "sending" | "sent" | "failed";
+  sent_at: string | null;
+  error: string;
+};
+
+type Handover = { completion_email?: CompletionEmail | null; id: number; reference: string; sale_reference: string; customer_name: string; vehicle_reference: string; vehicle_name: string; status: HandoverStatus; delivery_date: string | null; vehicle_condition_checklist: Checklist; keys_documents_checklist: Checklist; customer_acknowledgement: string; customer_acknowledged_at: string | null; evidence_attached: boolean; evidence_url: string | null; document_receipt: DocumentReceipt | null; internal_notes: string; prepared_by_name: string; created_at: string; updated_at: string; md_approved_by_name: string | null; md_approved_at: string | null; ceo_approved_by_name: string | null; ceo_approved_at: string | null; approval_history: Approval[]; finalized_by_name: string | null; finalized_at: string | null; financial_summary: FinancialSummary; commission_eligible: boolean };
 type FormState = { sale_reference: string; delivery_date: string; vehicle_condition_checklist: Checklist; keys_documents_checklist: Checklist; customer_acknowledgement: string; internal_notes: string; supporting_evidence: File | null };
 const conditionLabels: Record<string, string> = { bodywork: "Bodywork", interior: "Interior", tyres: "Tyres", lights: "Lights", odometer: "Odometer" };
 const documentLabels: Record<string, string> = { keys: "Keys", registration_documents: "Registration documents", insurance_documents: "Insurance documents", service_documents: "Service documents" };
@@ -160,6 +166,65 @@ export default function StaffHandovers() {
     } catch (e) { setError(e instanceof Error ? e.message : "Document acknowledgment could not be issued."); }
     finally { setBusy(false); }
   }
+  async function refreshCompletionEmail(retry = false) {
+    if (!selected || busy || selected.status !== "finalized") return;
+
+    const reference = selected.reference;
+    const emailStatus = selected.completion_email?.status;
+    const canRetry = user?.role === "manager" || user?.role === "ceo";
+
+    if (retry) {
+      if (!canRetry || !emailStatus ||
+          !["failed", "no_email", "queued"].includes(emailStatus)) {
+        return;
+      }
+
+      if (emailStatus === "failed" && !window.confirm(
+        "Have you verified with the mail provider that the previous email was NOT accepted? Only continue if confirmed."
+      )) {
+        return;
+      }
+    }
+
+    setBusy(true);
+    setError("");
+    setNotice("");
+
+    try {
+      const base = `/api/staff/handovers/${encodeURIComponent(reference)}/`;
+
+      const result = retry
+        ? await api<Handover>(`${base}retry-email/`, {
+            method: "POST",
+            body: JSON.stringify({
+              confirmed_not_accepted: emailStatus === "failed"
+            })
+          })
+        : await api<Handover>(base);
+
+      setSelected(current =>
+        current?.reference === reference ? result : current
+      );
+
+      setItems(current =>
+        current.map(item =>
+          item.reference === reference ? result : item
+        )
+      );
+
+      setNotice(retry
+        ? "Email retry processed. Check the updated delivery status."
+        : "Email delivery status refreshed.");
+
+    } catch (e) {
+      setError(e instanceof Error
+        ? e.message
+        : "Unable to update email delivery status.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function downloadDocumentReceipt() {
     if (!selected?.document_receipt) return;
     try {
@@ -246,9 +311,116 @@ export default function StaffHandovers() {
         <section className="handover-review-section"><h4>Vehicle condition</h4><ul>{Object.entries(conditionLabels).map(([key, text]) => <li key={key} className={selected.vehicle_condition_checklist?.[key] ? "is-done" : "is-missing"}>{text}<strong>{selected.vehicle_condition_checklist?.[key] ? "Complete" : "Incomplete"}</strong></li>)}</ul><h4>Keys and documents</h4><ul>{Object.entries(documentLabels).map(([key, text]) => <li key={key} className={selected.keys_documents_checklist?.[key] ? "is-done" : "is-missing"}>{text}<strong>{selected.keys_documents_checklist?.[key] ? "Complete" : "Incomplete"}</strong></li>)}</ul>
           <p className={`handover-acknowledgement ${selected.customer_acknowledgement ? "is-done" : "is-missing"}`}><strong>Customer acknowledgement</strong><span>{selected.customer_acknowledgement || "Not recorded"}</span>{selected.customer_acknowledged_at && <small>{dateTime(selected.customer_acknowledged_at)}</small>}</p>
           {selected.evidence_attached && <button className="inventory-secondary" onClick={() => void openEvidence()}>Download private evidence</button>}
-          {selected.internal_notes && <p className="handover-internal-notes"><strong>Internal notes</strong><span>{selected.internal_notes}</span></p>}
+          {selected.internal_notes && (
+            <div className="handover-internal-notes">
+              <strong>Historical internal notes</strong>
+              <p style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+                {selected.internal_notes}
+              </p>
+              <small>
+                Original preparation notes retained for audit purposes.
+                Refer to the current payment review for the latest balance.
+              </small>
+              {Number(selected.financial_summary.outstanding_balance_lkr) === 0 && (
+                <p role="status" style={{ color: "#15803d", fontWeight: 600 }}>
+                  Current outstanding balance: {money(0)}.
+                  No outstanding payment remains.
+                </p>
+              )}
+            </div>
+          )}
         </section>
-        <section className={`handover-financial-review ${selected.financial_summary.balance_review_required ? "has-balance" : ""}`}><h4>Payment review</h4><dl>{Number(selected.financial_summary.required_down_payment_lkr) > 0 && <><div><dt>Required reservation down payment</dt><dd>{money(selected.financial_summary.required_down_payment_lkr)}</dd></div><div><dt>Verified toward down payment</dt><dd>{money(selected.financial_summary.down_payment_verified_lkr)}</dd></div></>}<div><dt>Verified payments</dt><dd>{money(selected.financial_summary.verified_received_lkr)}</dd></div><div><dt>Legacy pending</dt><dd>{money(selected.financial_summary.pending_verification_lkr)}</dd></div><div><dt>Outstanding balance</dt><dd>{money(selected.financial_summary.outstanding_balance_lkr)}</dd></div></dl>{selected.financial_summary.balance_review_required && <p>The outstanding balance remains due and unpaid after handover. Record the finance settlement as confirmed after the funds have been received and cleared.</p>}{canManagePayments && <Link className="inventory-secondary" href={`/staff/payments?target_type=sale&reference=${encodeURIComponent(selected.sale_reference)}`}>Record payment against this sale</Link>}</section>
+        <section className={`handover-financial-review ${selected.financial_summary.balance_review_required ? "has-balance" : ""}`}><h4>Payment review</h4><dl>{Number(selected.financial_summary.required_down_payment_lkr) > 0 && <><div><dt>Required reservation down payment</dt><dd>{money(selected.financial_summary.required_down_payment_lkr)}</dd></div><div><dt>Verified toward down payment</dt><dd>{money(selected.financial_summary.down_payment_verified_lkr)}</dd></div></>}<div><dt>Verified payments</dt><dd>{money(selected.financial_summary.verified_received_lkr)}</dd></div><div><dt>Legacy pending</dt><dd>{money(selected.financial_summary.pending_verification_lkr)}</dd></div><div><dt>Outstanding balance</dt><dd>{money(selected.financial_summary.outstanding_balance_lkr)}</dd></div></dl>{selected.financial_summary.balance_review_required ? (
+            <p>
+              {selected.status === "finalized"
+                ? "The outstanding balance remains due after handover."
+                : "An outstanding balance remains on this sale."}
+              {" "}Record settlement only after funds have been received and cleared.
+            </p>
+          ) : Number(selected.financial_summary.outstanding_balance_lkr) === 0 ? (
+            <p role="status" style={{ color: "#15803d", fontWeight: 600 }}>
+              Fully settled - no outstanding payment remains.
+            </p>
+          ) : null}{canManagePayments && <Link className="inventory-secondary" href={`/staff/payments?target_type=sale&reference=${encodeURIComponent(selected.sale_reference)}`}>Record payment against this sale</Link>}</section>
+        {selected.status === "finalized" && (
+          <section className="handover-document-receipt">
+            <h4>Customer handover confirmation email</h4>
+            <p>Automatic confirmation of completed vehicle delivery.</p>
+
+            {selected.completion_email ? (
+              <>
+                <dl>
+                  <div>
+                    <dt>Delivery status</dt>
+                    <dd>
+                      <strong>
+                        {{
+                          no_email: "No valid email address",
+                          queued: "Queued",
+                          sending: "Sending",
+                          sent: "Accepted by mail service",
+                          failed: "Sending failed"
+                        }[selected.completion_email.status]}
+                      </strong>
+                    </dd>
+                  </div>
+
+                  {selected.completion_email.sent_at && (
+                    <div>
+                      <dt>Sent at</dt>
+                      <dd>{dateTime(selected.completion_email.sent_at)}</dd>
+                    </div>
+                  )}
+                </dl>
+
+                                <div className="handover-actions">
+                  <button
+                    type="button"
+                    className="inventory-secondary"
+                    disabled={busy}
+                    onClick={() => void refreshCompletionEmail()}
+                  >
+                    Refresh status
+                  </button>
+
+                  {(user?.role === "manager" || user?.role === "ceo") &&
+                    ["failed", "no_email", "queued"].includes(
+                      selected.completion_email.status
+                    ) && (
+                      <button
+                        type="button"
+                        className="primary-button"
+                        disabled={busy}
+                        onClick={() => void refreshCompletionEmail(true)}
+                      >
+                        {busy ? "Processing..." : "Retry email"}
+                      </button>
+                    )}
+                </div>
+
+                {selected.completion_email.status === "sent" && (
+                  <p role="status">
+                    The customer's handover confirmation was accepted
+                    by the mail service.
+                  </p>
+                )}
+
+                {selected.completion_email.error && (
+                  <p className="reservation-feedback is-error" role="alert">
+                    {selected.completion_email.error}
+                  </p>
+                )}
+
+                {selected.completion_email.status === "no_email" && (
+                  <p>Please verify the customer's email address.</p>
+                )}
+              </>
+            ) : (
+              <p>No email delivery record exists for this handover.</p>
+            )}
+          </section>
+        )}
+
         <section className="handover-document-receipt"><h4>Customer document acknowledgment</h4><p>This receipt records delivery of the listed company/vehicle items only; it is not proof of payment.</p>{selected.document_receipt ? <><p role="status">{selected.document_receipt.reference} issued by {selected.document_receipt.issued_by_name} · {dateTime(selected.document_receipt.issued_at)}</p><p>Items: {selected.document_receipt.items_handed_over.map((item) => item.label).join(", ")}</p><button className="primary-button" disabled={busy} onClick={() => void downloadDocumentReceipt()}>Download / print acknowledgment PDF</button></> : canIssueDocumentReceipt && selected.status === "finalized" && <button className="primary-button" disabled={busy} onClick={() => void issueDocumentReceipt()}>{busy ? "Issuing…" : "Issue document acknowledgment"}</button>}</section>
         {canEdit && selected.status !== "finalized" && <div className="handover-actions">{selected.status === "preparing" ? <><button type="button" className="inventory-secondary" disabled={busy || editing} onClick={beginEdit}>{editing ? "Editing preparation" : "Edit preparation"}</button><button type="button" className="primary-button" disabled={busy || editing || !preparationComplete} onClick={() => void submitReview()}>{busy ? "Submitting…" : "Submit for MD Review"}</button>
 {editing ? <p className="reservation-hint">Save your preparation changes before submitting for review.</p> : !preparationComplete && <p className="reservation-hint">Complete and save all required preparation items before submitting for MD review.</p>}</> : <a className="inventory-secondary" href="#approval-history">View Review Status</a>}</div>}

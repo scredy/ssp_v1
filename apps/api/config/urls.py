@@ -7,7 +7,7 @@ from rest_framework.response import Response
 from accounts.views import (
     AccountAccessLinkView, AccountDetailView, AccountListCreateView, CommissionLedgerTransitionView, CommissionLedgerView, CommissionRulesView, CsrfView, CurrentUserView,
     HandoverCEOApprovalView, HandoverCollectionView, HandoverDetailView, HandoverDocumentReceiptView, HandoverEligibleSalesView, HandoverEvidenceView, HandoverFinalizeView,
-    HandoverMDApprovalView, HandoverReturnView, HandoverSubmitView, LoginView, LogoutView, ManagerOversightView, NotificationCollectionView, NotificationDetailView, PasswordResetRequestView, PasswordSetupView,
+    HandoverEmailRetryView, HandoverMDApprovalView, HandoverReturnView, HandoverSubmitView, LoginView, LogoutView, ManagerOversightView, NotificationCollectionView, NotificationDetailView, PasswordResetRequestView, PasswordSetupView,
     ManagerRepsView, ManagerSalesView, RecentActivityView, RepDashboardView,
     PublicVehicleDetailView, PublicVehicleListView, StaffImportsView, StaffInventoryDetailView,
     StaffInventoryView, StaffReservationsView, StaffVehiclePhotoDetailView, StaffVehiclePhotosView,
@@ -128,6 +128,7 @@ urlpatterns = [
     path("api/staff/handovers/<str:reference>/approve-ceo/", HandoverCEOApprovalView.as_view(), name="handover-approve-ceo"),
     path("api/staff/handovers/<str:reference>/return/", HandoverReturnView.as_view(), name="handover-return"),
     path("api/staff/handovers/<str:reference>/finalize/", HandoverFinalizeView.as_view(), name="handover-finalize"),
+    path("api/staff/handovers/<str:reference>/retry-email/", HandoverEmailRetryView.as_view(), name="handover-retry-email"),
     path("api/staff/handovers/<str:reference>/document-receipt/", HandoverDocumentReceiptView.as_view(), name="handover-document-receipt-issue"),
     path("api/staff/handovers/<str:reference>/document-receipt/<str:receipt_reference>/pdf/", HandoverDocumentReceiptView.as_view(), name="handover-document-receipt-pdf"),
     path("api/staff/handovers/<str:reference>/evidence/", HandoverEvidenceView.as_view(), name="handover-evidence"),
