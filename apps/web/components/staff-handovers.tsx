@@ -41,9 +41,22 @@ export default function StaffHandovers() {
   const [returnDialog, setReturnDialog] = useState(false);
   const [returnReason, setReturnReason] = useState("");
 
+  const preparationFormRef = useRef<HTMLFormElement>(null);
+
+  useEffect(() => {
+    if (editing && preparationFormRef.current) {
+      preparationFormRef.current.focus({ preventScroll: true });
+      preparationFormRef.current.scrollIntoView({
+        behavior: "auto",
+        block: "start"
+      });
+    }
+  }, [editing]);
+
   const canCreate = user?.role === "staff";
   const canEdit = user?.role === "staff";
-  const canManagePayments = user?.role === "staff" || user?.role === "manager";
+  const canManagePayments = user?.role === "ceo" || user?.role === "manager";
+  const canIssueDocumentReceipt = user?.role === "staff" || user?.role === "manager";
   const canApproveMD = user?.role === "manager";
   const canApproveCEO = user?.role === "ceo";
   const canFinalize = user?.role === "manager";
@@ -137,7 +150,7 @@ export default function StaffHandovers() {
     finally { setBusy(false); }
   }
   async function issueDocumentReceipt() {
-    if (!selected || selected.status !== "finalized" || !canManagePayments) return;
+    if (!selected || selected.status !== "finalized" || !canIssueDocumentReceipt) return;
     setBusy(true); setError(""); setNotice("");
     try {
       const receipt = await api<DocumentReceipt>(`/api/staff/handovers/${encodeURIComponent(selected.reference)}/document-receipt/`, { method: "POST", body: "{}" });
@@ -170,6 +183,14 @@ export default function StaffHandovers() {
 
   const counts = { total: items.length, preparing: items.filter((item) => item.status === "preparing").length, review: items.filter((item) => item.status === "pending_md_review" || item.status === "pending_ceo_approval" || item.status === "ceo_approved").length, finalized: items.filter((item) => item.status === "finalized").length };
   const checksComplete = (selected ? Object.values(conditionLabels).length === Object.keys(conditionLabels).length && Object.keys(conditionLabels).every((key) => selected.vehicle_condition_checklist?.[key] === true) && Object.keys(documentLabels).every((key) => selected.keys_documents_checklist?.[key] === true) : false);
+  const preparationComplete = Boolean(
+    selected &&
+    checksComplete &&
+    selected.delivery_date &&
+    selected.customer_acknowledgement?.trim() &&
+    selected.customer_acknowledged_at
+  );
+
   const workflowSteps = ["Preparation", "MD Review", "CEO Approval", "Finalized"];
   const workflowIndex = selected ? ({ preparing: 0, pending_md_review: 1, pending_ceo_approval: 2, ceo_approved: 3, finalized: 3 } as Record<HandoverStatus, number>)[selected.status] : 0;
   const workflowRole = selected ? ({ preparing: "Staff", pending_md_review: "MD/Manager", pending_ceo_approval: "CEO", ceo_approved: "MD/Manager — delivery finalization", finalized: "Complete" } as Record<HandoverStatus, string>)[selected.status] : "Staff";
@@ -200,7 +221,7 @@ export default function StaffHandovers() {
       <article><span className="handover-stat-icon" aria-hidden="true">✓</span><div><span>Finalized</span><strong>{counts.finalized}</strong></div></article>
     </section>
     {error && <p className="reservation-feedback is-error" role="alert">{error}</p>}{notice && <p className="reservation-feedback" role="status">{notice}</p>}
-    {editing && canCreate && <form className="reservation-form handover-form" onSubmit={save}>
+    {editing && canCreate && <form ref={preparationFormRef} tabIndex={-1} className="reservation-form handover-form" onSubmit={save}>
       <div className="reservation-form-heading"><div><p className="eyebrow">{selected ? "PREPARATION RECORD" : "NEW HANDOVER"}</p><h3>{selected ? `Edit ${selected.reference}` : "Prepare a confirmed sale"}</h3></div><button type="button" className="inventory-secondary" onClick={() => setEditing(false)}>Cancel</button></div>
       <div className="handover-form-grid">
         <section className="handover-form-card handover-sale-card"><header><span aria-hidden="true">♧</span><div><h4>Sale &amp; Delivery Information</h4><p>Select the confirmed sale and set the delivery details.</p></div></header><div className="handover-card-body">
@@ -228,8 +249,9 @@ export default function StaffHandovers() {
           {selected.internal_notes && <p className="handover-internal-notes"><strong>Internal notes</strong><span>{selected.internal_notes}</span></p>}
         </section>
         <section className={`handover-financial-review ${selected.financial_summary.balance_review_required ? "has-balance" : ""}`}><h4>Payment review</h4><dl>{Number(selected.financial_summary.required_down_payment_lkr) > 0 && <><div><dt>Required reservation down payment</dt><dd>{money(selected.financial_summary.required_down_payment_lkr)}</dd></div><div><dt>Verified toward down payment</dt><dd>{money(selected.financial_summary.down_payment_verified_lkr)}</dd></div></>}<div><dt>Verified payments</dt><dd>{money(selected.financial_summary.verified_received_lkr)}</dd></div><div><dt>Legacy pending</dt><dd>{money(selected.financial_summary.pending_verification_lkr)}</dd></div><div><dt>Outstanding balance</dt><dd>{money(selected.financial_summary.outstanding_balance_lkr)}</dd></div></dl>{selected.financial_summary.balance_review_required && <p>The outstanding balance remains due and unpaid after handover. Record the finance settlement as confirmed after the funds have been received and cleared.</p>}{canManagePayments && <Link className="inventory-secondary" href={`/staff/payments?target_type=sale&reference=${encodeURIComponent(selected.sale_reference)}`}>Record payment against this sale</Link>}</section>
-        <section className="handover-document-receipt"><h4>Customer document acknowledgment</h4><p>This receipt records delivery of the listed company/vehicle items only; it is not proof of payment.</p>{selected.document_receipt ? <><p role="status">{selected.document_receipt.reference} issued by {selected.document_receipt.issued_by_name} · {dateTime(selected.document_receipt.issued_at)}</p><p>Items: {selected.document_receipt.items_handed_over.map((item) => item.label).join(", ")}</p><button className="primary-button" disabled={busy} onClick={() => void downloadDocumentReceipt()}>Download / print acknowledgment PDF</button></> : canManagePayments && selected.status === "finalized" && <button className="primary-button" disabled={busy} onClick={() => void issueDocumentReceipt()}>{busy ? "Issuing…" : "Issue document acknowledgment"}</button>}</section>
-        {canEdit && selected.status !== "finalized" && <div className="handover-actions">{selected.status === "preparing" ? <><button className="inventory-secondary" onClick={beginEdit}>Edit preparation</button><button className="primary-button" disabled={busy} onClick={() => void submitReview()}>{busy ? "Submitting…" : "Submit for MD Review"}</button></> : <a className="inventory-secondary" href="#approval-history">View Review Status</a>}</div>}
+        <section className="handover-document-receipt"><h4>Customer document acknowledgment</h4><p>This receipt records delivery of the listed company/vehicle items only; it is not proof of payment.</p>{selected.document_receipt ? <><p role="status">{selected.document_receipt.reference} issued by {selected.document_receipt.issued_by_name} · {dateTime(selected.document_receipt.issued_at)}</p><p>Items: {selected.document_receipt.items_handed_over.map((item) => item.label).join(", ")}</p><button className="primary-button" disabled={busy} onClick={() => void downloadDocumentReceipt()}>Download / print acknowledgment PDF</button></> : canIssueDocumentReceipt && selected.status === "finalized" && <button className="primary-button" disabled={busy} onClick={() => void issueDocumentReceipt()}>{busy ? "Issuing…" : "Issue document acknowledgment"}</button>}</section>
+        {canEdit && selected.status !== "finalized" && <div className="handover-actions">{selected.status === "preparing" ? <><button type="button" className="inventory-secondary" disabled={busy || editing} onClick={beginEdit}>{editing ? "Editing preparation" : "Edit preparation"}</button><button type="button" className="primary-button" disabled={busy || editing || !preparationComplete} onClick={() => void submitReview()}>{busy ? "Submitting…" : "Submit for MD Review"}</button>
+{editing ? <p className="reservation-hint">Save your preparation changes before submitting for review.</p> : !preparationComplete && <p className="reservation-hint">Complete and save all required preparation items before submitting for MD review.</p>}</> : <a className="inventory-secondary" href="#approval-history">View Review Status</a>}</div>}
         {canApproveMD && selected.status === "pending_md_review" && <div className="handover-actions"><button className="inventory-secondary" disabled={busy} onClick={() => { setReturnReason(""); setReturnDialog(true); }}>Return to Staff with reason</button><button className="primary-button" disabled={busy || outstandingRequirements.length > 0} onClick={() => void approveMD()}>{busy ? "Submitting…" : "Approve & Submit to CEO"}</button></div>}
         {canApproveCEO && selected.status === "pending_ceo_approval" && <div className="handover-actions"><button className="inventory-secondary" disabled={busy} onClick={() => { setReturnReason(""); setReturnDialog(true); }}>Return to MD with reason</button><button className="primary-button" disabled={busy || outstandingRequirements.length > 0} onClick={() => void approveCEO()}>{busy ? "Approving…" : "Approve Handover"}</button></div>}
         {canFinalize && selected.status === "ceo_approved" && <div className="handover-actions"><button className="inventory-secondary" disabled={busy} onClick={() => { setReturnReason(""); setReturnDialog(true); }}>Return to Staff with reason</button><button className="primary-button" disabled={outstandingRequirements.length > 0} onClick={() => setConfirm(true)}>Finalize Handover</button></div>}
