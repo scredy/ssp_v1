@@ -142,7 +142,10 @@ CSRF_TRUSTED_ORIGINS = [origin.strip() for origin in os.environ.get(
     "CSRF_TRUSTED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
 ).split(",") if origin.strip()]
 CORS_ALLOW_CREDENTIALS = True
-EMAIL_BACKEND = os.environ.get("EMAIL_BACKEND", "django.core.mail.backends.console.EmailBackend" if DEBUG else "django.core.mail.backends.smtp.EmailBackend")
+EMAIL_BACKEND = os.environ.get(
+    "EMAIL_BACKEND",
+    "django.core.mail.backends.console.EmailBackend" if DEBUG else "accounts.email_backend.BrevoEmailBackend",
+)
 EMAIL_HOST = os.environ.get("EMAIL_HOST", "localhost")
 EMAIL_PORT = int(os.environ.get("EMAIL_PORT", "25"))
 EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER", "")
@@ -152,7 +155,10 @@ DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "SSP Motor Trading <no
 COMPANY_LOCATION = os.environ.get("COMPANY_LOCATION", "").strip()
 COMPANY_PHONE = os.environ.get("COMPANY_PHONE", os.environ.get("NEXT_PUBLIC_COMPANY_PHONE", "")).strip()
 COMPANY_EMAIL = os.environ.get("COMPANY_EMAIL", os.environ.get("NEXT_PUBLIC_COMPANY_EMAIL", "")).strip()
-ACCOUNT_PORTAL_URL = os.environ.get("ACCOUNT_PORTAL_URL", "http://localhost:3000").rstrip("/")
+ACCOUNT_PORTAL_URL = os.environ.get(
+    "ACCOUNT_PORTAL_URL",
+    "http://localhost:3000" if DEBUG else "https://ssp-frontend-xrli.onrender.com",
+).rstrip("/")
 SECURE_SSL_REDIRECT = not DEBUG
 # Render terminates TLS at its proxy and forwards the original scheme. Trust
 # that header so Django recognizes HTTPS and avoids redirect loops.

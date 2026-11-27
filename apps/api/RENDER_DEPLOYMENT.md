@@ -25,9 +25,25 @@ Set these in the Render service environment. Use the **internal** connection val
 | `POSTGRES_PORT` | Render PostgreSQL internal port |
 | `CORS_ALLOWED_ORIGINS` | Exact HTTPS origin(s) of the web app, comma separated |
 | `CSRF_TRUSTED_ORIGINS` | Exact HTTPS origin(s) of the web app, comma separated |
-| `ACCOUNT_PORTAL_URL` | Public web app URL used in account emails |
+| `ACCOUNT_PORTAL_URL` | `https://ssp-frontend-xrli.onrender.com` |
+| `EMAIL_BACKEND` | `accounts.email_backend.BrevoEmailBackend` |
+| `BREVO_API_KEY` | Private Brevo API key; set only in the backend Render service environment |
+| `BREVO_TIMEOUT_SECONDS` | `10` (or another positive timeout in seconds) |
+| `DEFAULT_FROM_EMAIL` | A sender name and address verified in Brevo, for example `SSP Motor Trading <no-reply@your-verified-domain.example>` |
 
-The app retains the `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_HOST`, and `POSTGRES_PORT` interface. Render supplies `PORT` to the start command. Configure working SMTP values for `EMAIL_HOST`, `EMAIL_PORT`, `EMAIL_HOST_USER`, `EMAIL_HOST_PASSWORD`, `EMAIL_USE_TLS`, and `DEFAULT_FROM_EMAIL`; production defaults to Django's SMTP backend. `EMAIL_BACKEND` can be set when intentionally using another backend. Company details can be supplied through `COMPANY_LOCATION`, `COMPANY_PHONE`, and `COMPANY_EMAIL`. Financing defaults can be overridden with `NEXT_PUBLIC_FINANCE_36M_PER_100K`, `NEXT_PUBLIC_FINANCE_60M_PER_100K`, `NEXT_PUBLIC_FINANCE_72M_PER_100K`, and `NEXT_PUBLIC_FINANCE_OD_PER_100K`.
+The app retains the `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_HOST`, and `POSTGRES_PORT` interface. Render supplies `PORT` to the start command. Production uses Brevo's HTTPS Transactional Email API, so Render's blocked SMTP ports are not involved. Set the four email variables above on the **backend API service**. In the Brevo dashboard, generate an API key and verify the sender domain/address used by `DEFAULT_FROM_EMAIL`; keep the key out of GitHub, frontend variables, logs, and build arguments. `EMAIL_BACKEND` defaults to Django's console backend in development and the Brevo backend in production. `BREVO_TIMEOUT_SECONDS` defaults to `10`. Company details can be supplied through `COMPANY_LOCATION`, `COMPANY_PHONE`, and `COMPANY_EMAIL`. Financing defaults can be overridden with `NEXT_PUBLIC_FINANCE_36M_PER_100K`, `NEXT_PUBLIC_FINANCE_60M_PER_100K`, `NEXT_PUBLIC_FINANCE_72M_PER_100K`, and `NEXT_PUBLIC_FINANCE_OD_PER_100K`.
+
+In Render, open the backend web service, choose **Environment**, and add:
+
+```text
+EMAIL_BACKEND=accounts.email_backend.BrevoEmailBackend
+BREVO_API_KEY=<paste the private Brevo API key>
+BREVO_TIMEOUT_SECONDS=10
+DEFAULT_FROM_EMAIL=<verified sender name and email>
+ACCOUNT_PORTAL_URL=https://ssp-frontend-xrli.onrender.com
+```
+
+Save and let Render restart the backend. Do not add `BREVO_API_KEY` to GitHub, the frontend service, or any `NEXT_PUBLIC_*` variable. The same backend handles employee and Admin invitations, secure password setup and resets, appointment confirmations, and the existing confirmation retry. The invitation transaction still rolls back if Brevo rejects a message or delivery fails; ambiguous timeouts are not automatically retried because Brevo may already have accepted the email.
 
 Render's `RENDER_EXTERNAL_HOSTNAME` is appended automatically to `DJANGO_ALLOWED_HOSTS` when present. Keep custom API domains in `DJANGO_ALLOWED_HOSTS`; the Render hostname addition does not replace them. Rejected hostnames are written by the `django.security.DisallowedHost` logger to service logs without logging request query strings or credentials.
 
