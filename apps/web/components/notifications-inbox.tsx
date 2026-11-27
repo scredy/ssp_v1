@@ -21,6 +21,7 @@ const PAGE_SIZE = 50;
 const KNOWN_TARGETS = [
   "/staff/handovers", "/staff/payments", "/staff/bl-requests", "/staff/imports",
   "/staff/enquiries", "/staff/my-sales", "/staff/commissions", "/staff/my-commissions", "/staff/sales",
+  "/staff/accounts", "/staff/activity", "/staff/commission-rules",
 ];
 const EMPTY_COUNTS: Counts = { all: 0, unread: 0, approvals: 0, handovers: 0, system: 0 };
 
@@ -91,16 +92,16 @@ export default function NotificationsInbox() {
     return () => window.clearTimeout(timeout);
   }, [searchInput]);
 
-  const loadPage = useCallback(async (nextOffset = 0) => {
+  const loadPage = useCallback(async (nextOffset = 0, silent = false) => {
     const version = ++requestVersion.current;
-    setLoading(true);
+    if (!silent) setLoading(true);
     setError("");
     const params = new URLSearchParams({ limit: String(PAGE_SIZE), offset: String(nextOffset) });
     if (category !== "all") params.set("category", category);
     if (dateRange !== "all") params.set("period", dateRange);
     if (search) params.set("search", search);
     try {
-      const page = await api<NotificationPage>(`/api/notifications/?${params.toString()}`);
+      const page = await api<NotificationPage>(`/api/notifications/?${params.toString()}`, { cache: "no-store" });
       if (version !== requestVersion.current) return;
       setItems(page.results);
       setCount(page.count);
@@ -116,6 +117,27 @@ export default function NotificationsInbox() {
 
   useEffect(() => { void loadPage(0); }, [loadPage]);
 
+  useEffect(() => {
+    // Avoid interrupting read/unread changes or browsing older pages.
+    if (loading || bulkLoading || updatingIds.size > 0 || offset !== 0) return;
+
+    const refresh = () => {
+      if (document.visibilityState === "visible") {
+        void loadPage(0, true);
+      }
+    };
+
+    const interval = window.setInterval(refresh, 30000);
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, [loadPage, loading, bulkLoading, updatingIds.size, offset]);
+
   const updateRead = useCallback(async (item: NotificationItem, isRead: boolean) => {
     if (updatingIds.has(item.id) || bulkLoading) return false;
     setError("");
@@ -127,11 +149,10 @@ export default function NotificationsInbox() {
       });
       setItems((current) => current.map((row) => row.id === updated.id ? updated : row));
       if (item.is_read !== updated.is_read) {
-        const nextUnread = Math.max(0, unreadCount + (updated.is_read ? -1 : 1));
-        setCategoryCounts((current) => current ? { ...current, unread: nextUnread } : current);
-        publishUnreadCount(nextUnread);
+        const nextOffset = category === "unread" && updated.is_read &&
+          items.length === 1 ? Math.max(0, offset - PAGE_SIZE) : offset;
+        await loadPage(nextOffset, true);
       }
-      if (category === "unread" && updated.is_read) void loadPage(offset);
       return true;
     } catch {
       setError("That notification could not be updated. Please retry.");
@@ -139,7 +160,7 @@ export default function NotificationsInbox() {
     } finally {
       setUpdatingIds((current) => { const next = new Set(current); next.delete(item.id); return next; });
     }
-  }, [bulkLoading, category, loadPage, offset, unreadCount, updatingIds]);
+  }, [bulkLoading, category, loadPage, offset, items.length, updatingIds]);
 
   async function openItem(event: MouseEvent<HTMLAnchorElement>, item: NotificationItem) {
     if (item.is_read) return;
@@ -235,6 +256,9 @@ export default function NotificationsInbox() {
           <option value="7d">Last 7 days</option><option value="30d">Last 30 days</option>
         </select>
       </label>
+      <button className="notification-mark-all" type="button"
+        disabled={loading || bulkLoading || updatingIds.size > 0}
+        onClick={() => void loadPage(offset)}>Refresh</button>
       <button className="notification-mark-all" type="button" disabled={loading || bulkLoading || unreadCount === 0}
         onClick={() => void markAllRead()}>{bulkLoading ? "Marking as read…" : "Mark all as read"}</button>
     </section>

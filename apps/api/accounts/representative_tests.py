@@ -209,3 +209,46 @@ class RepresentativeApiTests(APITestCase):
         self.client.force_authenticate(ceo)
         self.assertEqual(self.client.post(f"/api/commissions/{other_entry.pk}/transition/", payout_payload, format="json").status_code, status.HTTP_409_CONFLICT)
         self.assertEqual(AuditEvent.objects.filter(action="commission.reversed", subject=other_sale.reference).count(), 1)
+
+
+        # commission_notification_regression
+        from .models import Notification
+
+        other_entry.refresh_from_db()
+        prefix = f"commission:{other_entry.pk}:"
+
+        for action in ("approved", "paid"):
+            notices = Notification.objects.filter(
+                deduplication_key=prefix + action
+            )
+            self.assertEqual(notices.count(), 1, action)
+            notice = notices.get()
+            self.assertEqual(notice.recipient_id, other_entry.recipient_id)
+            self.assertEqual(notice.target_url, "/staff/my-commissions")
+
+        reversed_event = AuditEvent.objects.filter(
+            action="commission.reversed",
+            subject=other_entry.sale.reference,
+        ).exists()
+
+        self.assertEqual(
+            Notification.objects.filter(
+                deduplication_key=prefix + "reversed"
+            ).count(),
+            int(reversed_event),
+        )
+
+        self.assertFalse(
+            Notification.objects.filter(
+                deduplication_key__startswith=prefix
+            ).exclude(recipient_id=other_entry.recipient_id).exists()
+        )
+
+        self.client.force_authenticate(other_entry.recipient)
+        inbox = self.client.get("/api/notifications/")
+        self.assertEqual(inbox.status_code, 200)
+        self.assertTrue(any(
+            row["title"] == "Commission paid"
+            and other_entry.sale.reference in row["message"]
+            for row in inbox.data["results"]
+        ))

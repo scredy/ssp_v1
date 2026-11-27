@@ -258,7 +258,7 @@ test('Continuation: sales, payment review, handover, commission, Rep and notific
       expect(existing.data.status).toBe('ceo_approved');
       await detail.getByRole('button', { name: 'Finalize Handover' }).click();
       await page.getByRole('button', { name: 'Confirm handover finalization' }).click();
-      await expect(page.getByRole('status')).toContainText('finalized');
+      await expect(page.getByRole('status').filter({ hasText: /finalized/ })).toContainText('finalized');
       return `${s.handover} finalized; UI shows outstanding ${s.reservationBalanceDisplay} and does not mark it paid.`;
     });
 

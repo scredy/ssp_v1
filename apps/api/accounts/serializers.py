@@ -211,6 +211,14 @@ class StaffEnquirySerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         status_value = attrs.get("status", self.instance.status if self.instance else Enquiry.Status.NEW)
         scheduled = attrs.get("scheduled_at", self.instance.scheduled_at if self.instance else None)
+        if (
+            self.instance is not None
+            and self.instance.kind not in (Enquiry.Kind.APPOINTMENT, Enquiry.Kind.TEST_DRIVE)
+            and attrs.get("scheduled_at") is not None
+        ):
+            raise serializers.ValidationError(
+                {"scheduled_at": "Only appointments and test drives support scheduling."}
+            )
         if status_value == Enquiry.Status.SCHEDULED:
             if self.instance is None or self.instance.kind not in (Enquiry.Kind.APPOINTMENT, Enquiry.Kind.TEST_DRIVE):
                 raise serializers.ValidationError({"status": "Only appointment requests can be scheduled."})
@@ -568,6 +576,16 @@ class PaymentRejectSerializer(serializers.Serializer):
         if not value:
             raise serializers.ValidationError("A rejection reason is required.")
         return value
+
+
+class ImportAgreedPriceSerializer(serializers.Serializer):
+    agreed_price_lkr = serializers.DecimalField(
+        max_digits=14, decimal_places=2,
+        min_value=Decimal("0.01"),
+    )
+    reason = serializers.CharField(
+        max_length=1000, trim_whitespace=True
+    )
 
 
 class ImportOrderSerializer(serializers.ModelSerializer):

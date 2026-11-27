@@ -717,6 +717,10 @@ class ImportOrder(models.Model):
     reference = models.CharField(max_length=24, unique=True, editable=False)
     customer = models.ForeignKey(Customer, on_delete=models.PROTECT, related_name="import_orders")
     vehicle = models.ForeignKey(Vehicle, on_delete=models.SET_NULL, null=True, blank=True, related_name="import_orders")
+    agreed_price_lkr = models.DecimalField(
+        max_digits=14, decimal_places=2, null=True, blank=True,
+        validators=[MinValueValidator(Decimal("0.01"))],
+    )
     vehicle_description = models.CharField(max_length=240)
     vehicle_details = models.TextField(blank=True)
     country_of_origin = models.CharField(max_length=100)
@@ -731,6 +735,13 @@ class ImportOrder(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(agreed_price_lkr__isnull=True) |
+                          models.Q(agreed_price_lkr__gt=0),
+                name="import_agreed_price_positive",
+            ),
+        ]
 
     def save(self, *args, **kwargs):
         if not self.reference:

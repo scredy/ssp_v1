@@ -77,18 +77,61 @@ export default function StaffShell({ children }: { children: React.ReactNode }) 
   }, [isPublicAuth, router]);
 
   useEffect(() => {
-    if (!user) return;
+    if (!user || isPublicAuth) return;
     let active = true;
+    let inFlight = false;
+    let version = 0;
+
+    async function refreshCount() {
+      if (!active || inFlight || document.visibilityState === "hidden") return;
+      inFlight = true;
+      const currentVersion = ++version;
+
+      try {
+        const page = await api<{ unread_count: number }>(
+          "/api/notifications/?limit=1&offset=0",
+          { cache: "no-store" }
+        );
+
+        if (active && currentVersion === version &&
+            Number.isInteger(page.unread_count) && page.unread_count >= 0) {
+          setUnreadNotifications(page.unread_count);
+        }
+      } catch {
+        // Retain the last known count during temporary network failures.
+      } finally {
+        inFlight = false;
+      }
+    }
+
     const updateCount = (event: Event) => {
       const count = (event as CustomEvent<unknown>).detail;
-      if (typeof count === "number" && Number.isInteger(count) && count >= 0) setUnreadNotifications(count);
+      if (active && typeof count === "number" &&
+          Number.isInteger(count) && count >= 0) {
+        version++;
+        setUnreadNotifications(count);
+      }
     };
+
+    const refreshVisible = () => {
+      if (document.visibilityState === "visible") void refreshCount();
+    };
+
     window.addEventListener("ssp:notification-count", updateCount);
-    api<{ unread_count: number }>("/api/notifications/?limit=1&offset=0")
-      .then((page) => { if (active) setUnreadNotifications(page.unread_count); })
-      .catch(() => { if (active) setUnreadNotifications(null); });
-    return () => { active = false; window.removeEventListener("ssp:notification-count", updateCount); };
-  }, [user?.username]);
+    window.addEventListener("focus", refreshVisible);
+    document.addEventListener("visibilitychange", refreshVisible);
+
+    void refreshCount();
+    const interval = window.setInterval(refreshVisible, 30000);
+
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+      window.removeEventListener("ssp:notification-count", updateCount);
+      window.removeEventListener("focus", refreshVisible);
+      document.removeEventListener("visibilitychange", refreshVisible);
+    };
+  }, [user?.username, isPublicAuth, pathname]);
 
   useEffect(() => {
     const redirect = staffRouteRedirect(pathname, user?.role, routeRoles);
@@ -108,6 +151,7 @@ export default function StaffShell({ children }: { children: React.ReactNode }) 
     try {
       await api<void>("/api/auth/logout/", { method: "POST", body: "{}" });
       setUser(null);
+      setUnreadNotifications(null);
       router.replace("/staff/login");
     } catch {
       setSignOutError("Sign out failed. Please try again.");

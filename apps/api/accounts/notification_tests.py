@@ -74,3 +74,98 @@ class NotificationApiTests(APITestCase):
             self.assertEqual(response.status_code, status.HTTP_200_OK, role)
             self.assertEqual(response.data["count"], 1, role)
             self.assertEqual(response.data["results"][0]["title"], "Own notification")
+
+    def test_public_enquiry_notifies_only_authorized_roles(self):
+        from django.core.cache import cache
+
+        cache.clear()
+        manager = User.objects.create_user(
+            username="event-manager", role=User.Role.MANAGER
+        )
+        admin = User.objects.create_user(
+            username="event-admin", role=User.Role.ADMIN
+        )
+        rep = User.objects.create_user(
+            username="event-rep", role=User.Role.REP
+        )
+        inactive = User.objects.create_user(
+            username="inactive-manager",
+            role=User.Role.MANAGER,
+            is_active=False,
+        )
+
+        self.client.force_authenticate(None)
+
+        payload = {
+            "full_name": "Notification Test Customer",
+            "phone": "0771234567",
+            "preferred_contact": "phone",
+            "kind": "general",
+            "message": "Notification workflow regression test",
+            "idempotency_key": "notification-event-test-12345",
+        }
+
+        response = self.client.post(
+            "/api/public/enquiries/", payload, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        repeated = self.client.post(
+            "/api/public/enquiries/", payload, format="json"
+        )
+        self.assertEqual(repeated.status_code, status.HTTP_200_OK)
+
+        notices = Notification.objects.filter(
+            deduplication_key__endswith=":general-requested"
+        )
+
+        self.assertSetEqual(
+            set(notices.values_list("recipient_id", flat=True)),
+            {self.staff.pk, self.other.pk, manager.pk},
+        )
+        self.assertEqual(notices.count(), 3)
+
+        for user in (admin, rep, inactive):
+            self.assertFalse(notices.filter(recipient=user).exists())
+
+        for user in (self.staff, self.other, manager):
+            self.client.force_authenticate(user)
+            listing = self.client.get("/api/notifications/")
+            self.assertEqual(listing.status_code, status.HTTP_200_OK)
+            self.assertTrue(any(
+                response.data["reference"] in row["message"]
+                for row in listing.data["results"]
+            ))
+
+    def test_account_deactivation_generates_admin_notification(self):
+        from rest_framework.test import APIRequestFactory, force_authenticate
+        from .views import AccountDetailView
+
+        admin = User.objects.create_user(
+            username="account-event-admin",
+            role=User.Role.ADMIN,
+        )
+        factory = APIRequestFactory()
+        request = factory.patch(
+            "/account-test/",
+            {"is_active": False},
+            format="json",
+        )
+        force_authenticate(request, user=admin)
+
+        response = AccountDetailView.as_view()(
+            request, account_id=self.staff.pk
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        notices = Notification.objects.filter(
+            title="Account deactivated"
+        )
+        self.assertEqual(notices.count(), 1)
+        self.assertEqual(notices.first().recipient_id, admin.pk)
+        self.assertEqual(notices.first().target_url, "/staff/accounts")
+
+        self.client.force_authenticate(admin)
+        listing = self.client.get("/api/notifications/")
+        self.assertEqual(listing.data["count"], 1)
+        self.assertEqual(listing.data["unread_count"], 1)
