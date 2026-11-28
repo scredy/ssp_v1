@@ -13,7 +13,7 @@ CAPABILITIES = {
     "sales.oversight": {"manager"},
     "inventory.workflows": {"staff"},
     "inventory.review": {"staff", "ceo", "manager"},
-    "imports.workflows": {"staff"},
+    "imports.workflows": {"staff", "ceo"},
     "reservations.workflows": {"staff"},
     "sales.own": {"rep"},
     "commission.own": {"rep"},
@@ -81,19 +81,33 @@ class CustomerAccess(BasePermission):
 
 
 class SalesAccess(BasePermission):
-    """Managers manage sales; CEO reviews them; staff receive summary-only access."""
+    """MD manages normal sales; CEO manages import sales."""
 
     def has_permission(self, request, view):
         if not request.user or not request.user.is_authenticated:
             return False
+
         role = request.user.role
+
         if getattr(view, "options_only", False):
-            return role == "manager"
+            return (
+                role in {"manager", "ceo"}
+                and request.method in {"GET", "HEAD", "OPTIONS"}
+            )
+
         if getattr(view, "summary_only", False):
-            return role in {"staff", "manager", "ceo"}
-        if request.method in ("GET", "HEAD", "OPTIONS"):
+            return (
+                role in {"staff", "manager", "ceo"}
+                and request.method in {"GET", "HEAD", "OPTIONS"}
+            )
+
+        if request.method in {"GET", "HEAD", "OPTIONS"}:
             return role in {"manager", "ceo"}
-        return role == "manager"
+
+        return (
+            request.method == "POST"
+            and role in {"manager", "ceo"}
+        )
 
 
 class PaymentAccess(BasePermission):
@@ -106,8 +120,8 @@ class PaymentAccess(BasePermission):
         action = getattr(view, "payment_action", "")
         if action == "import_settlement":
             if request.method in {"GET", "HEAD", "OPTIONS"}:
-                return role in {"staff", "ceo", "manager"}
-            return request.method == "PATCH" and role in {"ceo", "manager"}
+                return role in {"staff", "ceo"}
+            return request.method == "PATCH" and role == "ceo"
         if action == "settlement_summary":
             return request.method in {"GET", "HEAD", "OPTIONS"} and role in {"staff", "ceo", "manager"}
         if action == "record":
@@ -157,38 +171,52 @@ class HandoverAccess(BasePermission):
 
 
 class QuotationAccess(BasePermission):
-    """Staff and MD manage quotations; CEO can read; Admin and Rep are excluded."""
+    """Quotation access is restricted by role and import linkage in the views."""
 
     def has_permission(self, request, view):
         if not request.user or not request.user.is_authenticated:
             return False
-        role = request.user.role
-        action = getattr(view, "quotation_action", "")
-        if action in {"issue", "void"}:
-            return request.method in {"POST", "PATCH"} and role in {"staff", "manager"}
-        if action == "write" and request.method in {"POST", "PATCH"}:
-            return role in {"staff", "manager"}
-        if action == "collection":
-            return ((request.method == "GET" and role in {"staff", "ceo", "manager"}) or
-                    (request.method == "POST" and role in {"staff", "manager"}))
-        return request.method in {"GET", "HEAD", "OPTIONS"} and role in {"staff", "ceo", "manager"}
+
+        return (
+            request.user.role in {"staff", "manager", "ceo"}
+            and request.method in {"GET", "HEAD", "OPTIONS", "POST", "PATCH"}
+        )
 
 
 class ImportAccess(BasePermission):
-    """Staff manage imports; CEO and MD/Manager receive read-only progress access."""
+    """Import operations are restricted to Staff and CEO."""
 
     def has_permission(self, request, view):
         if not request.user or not request.user.is_authenticated:
             return False
+
+        role = request.user.role
+        method = request.method
+
+        if role not in {"staff", "ceo"}:
+            return False
+
         if getattr(view, "bl_decision", False):
-            return request.method == "POST" and request.user.role == "ceo"
+            return method == "POST" and role == "ceo"
+
+        if method in {"GET", "HEAD", "OPTIONS"}:
+            return True
+
         if getattr(view, "bl_collection", False):
-            if request.method in {"GET", "HEAD", "OPTIONS"}:
-                return request.user.role in {"staff", "ceo", "manager"}
-            return request.method == "POST" and request.user.role == "staff"
-        if request.method in {"GET", "HEAD", "OPTIONS"}:
-            return request.user.role in {"staff", "ceo", "manager"}
-        return request.user.role == "staff" and request.method in {"POST", "PATCH"}
+            return method == "POST" and role == "staff"
+
+        action = getattr(view, "import_action", "")
+
+        if action == "tracking_access":
+            return method == "POST" and role == "ceo"
+
+        if action == "milestones":
+            return method == "POST"
+
+        if action == "orders":
+            return method in {"POST", "PATCH"}
+
+        return False
 
 
 class CommissionLedgerAccess(BasePermission):

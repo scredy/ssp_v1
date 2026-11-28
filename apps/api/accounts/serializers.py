@@ -97,6 +97,43 @@ class VehiclePhotoSerializer(serializers.ModelSerializer):
 
 class StaffVehicleSerializer(serializers.ModelSerializer):
     photos = VehiclePhotoSerializer(many=True, read_only=True)
+    can_delete = serializers.SerializerMethodField()
+    has_import_link = serializers.SerializerMethodField()
+    has_active_import = serializers.SerializerMethodField()
+
+    def get_can_delete(self, obj):
+        request = self.context.get("request")
+
+        if not request or request.user.role != User.Role.STAFF:
+            return False
+
+        if obj.status not in {
+            Vehicle.Status.AVAILABLE,
+            Vehicle.Status.ARCHIVED,
+        }:
+            return False
+
+        for relation in Vehicle._meta.related_objects:
+            if relation.related_model is VehiclePhoto:
+                continue
+
+            if not (relation.one_to_many or relation.one_to_one):
+                continue
+
+            if relation.related_model._base_manager.filter(
+                **{relation.field.name: obj}
+            ).exists():
+                return False
+
+        return True
+
+    def get_has_import_link(self, obj):
+        return obj.import_orders.exists()
+
+    def get_has_active_import(self, obj):
+        return obj.import_orders.exclude(
+            status=ImportOrder.Status.HANDED_OVER
+        ).exists()
 
     class Meta:
         model = Vehicle
@@ -104,6 +141,7 @@ class StaffVehicleSerializer(serializers.ModelSerializer):
             "id", "reference", "make", "model", "variant", "manufacture_year", "mileage_km",
             "fuel_type", "transmission", "color", "condition", "internal_identifier",
             "asking_price_lkr", "description", "visibility", "status", "created_at", "updated_at", "photos",
+            "can_delete", "has_import_link", "has_active_import",
         )
         read_only_fields = ("id", "reference", "created_at", "updated_at", "photos")
 
@@ -112,6 +150,10 @@ class StaffVehicleSerializer(serializers.ModelSerializer):
         request = self.context.get("request")
         if request and getattr(request.user, "role", None) != User.Role.STAFF:
             fields.pop("internal_identifier", None)
+
+        if request and getattr(request.user, "role", None) == User.Role.MANAGER:
+            fields.pop("has_import_link", None)
+            fields.pop("has_active_import", None)
         return fields
 
     def validate_status(self, value):
@@ -177,12 +219,39 @@ class PublicEnquirySerializer(serializers.Serializer):
         elif attrs.get("requested_at"):
             raise serializers.ValidationError({"requested_at": "A requested time is only used for appointments."})
         reference = attrs.get("vehicle_reference", "").strip()
+
+        public_stock = Vehicle.objects.filter(
+            visibility=Vehicle.Visibility.PUBLISHED,
+            status=Vehicle.Status.AVAILABLE,
+            import_orders__isnull=True,
+        )
+
         if reference:
-            vehicle = Vehicle.objects.filter(reference=reference, visibility=Vehicle.Visibility.PUBLISHED,
-                                             status=Vehicle.Status.AVAILABLE).first()
+            vehicle = public_stock.filter(reference=reference).first()
+
             if not vehicle:
-                raise serializers.ValidationError({"vehicle_reference": "This vehicle is no longer available."})
+                raise serializers.ValidationError({
+                    "vehicle_reference": "This vehicle is no longer available."
+                })
+
             attrs["vehicle"] = vehicle
+
+        elif attrs["kind"] == Enquiry.Kind.QUOTE:
+            description = attrs.get("vehicle_description", "").strip()
+
+            if description and len(description) <= 16:
+                vehicle = public_stock.filter(
+                    reference__iexact=description
+                ).first()
+
+                if vehicle:
+                    attrs["vehicle"] = vehicle
+                    attrs["vehicle_description"] = (
+                        f"{vehicle.manufacture_year} "
+                        f"{vehicle.make} {vehicle.model} "
+                        f"{vehicle.variant}"
+                    ).strip()[:160]
+
         return attrs
 
 
@@ -206,7 +275,9 @@ class StaffEnquirySerializer(serializers.ModelSerializer):
                             "confirmation_email_sent_at", "confirmation_email_error", "created_at", "updated_at")
 
     def get_vehicle_label(self, obj):
-        return f"{obj.vehicle.manufacture_year} {obj.vehicle.make} {obj.vehicle.model}" if obj.vehicle else ""
+        if obj.vehicle:
+            return f"{obj.vehicle.manufacture_year} {obj.vehicle.make} {obj.vehicle.model}"
+        return obj.vehicle_description.strip()
 
     def validate(self, attrs):
         status_value = attrs.get("status", self.instance.status if self.instance else Enquiry.Status.NEW)
@@ -528,7 +599,7 @@ class PaymentCreateSerializer(serializers.Serializer):
 class PaymentSerializer(serializers.ModelSerializer):
     sale_reference = serializers.CharField(source="sale.reference", read_only=True, allow_null=True)
     reservation_reference = serializers.CharField(source="reservation.reference", read_only=True, allow_null=True)
-    import_reference = serializers.CharField(source="import_order.reference", read_only=True, allow_null=True)
+    import_reference = serializers.SerializerMethodField()
     customer_name = serializers.SerializerMethodField()
     recorded_by_name = serializers.CharField(source="recorded_by.username", read_only=True)
     verified_by_name = serializers.CharField(source="verified_by.username", read_only=True, allow_null=True)
@@ -589,9 +660,15 @@ class ImportAgreedPriceSerializer(serializers.Serializer):
 
 
 class ImportOrderSerializer(serializers.ModelSerializer):
-    customer_id = serializers.PrimaryKeyRelatedField(source="customer", queryset=Customer.objects.all(), write_only=True)
+    customer_id = serializers.PrimaryKeyRelatedField(source="customer", queryset=Customer.objects.all())
     customer_name = serializers.CharField(source="customer.full_name", read_only=True)
-    vehicle_id = serializers.PrimaryKeyRelatedField(source="vehicle", queryset=Vehicle.objects.all(), required=False, allow_null=True)
+    vehicle_id = serializers.PrimaryKeyRelatedField(
+        source="vehicle",
+        queryset=Vehicle.objects.all(),
+        required=True,
+        allow_null=False,
+    )
+    vehicle_description = serializers.SerializerMethodField()
     vehicle_reference = serializers.CharField(source="vehicle.reference", read_only=True, allow_null=True)
     responsible_staff_name = serializers.CharField(source="responsible_staff.username", read_only=True)
 
@@ -602,22 +679,71 @@ class ImportOrderSerializer(serializers.ModelSerializer):
                   "estimated_arrival", "internal_notes", "customer_updates", "responsible_staff_name", "created_at", "updated_at")
         read_only_fields = ("id", "reference", "customer_name", "vehicle_reference", "status", "responsible_staff_name", "created_at", "updated_at")
 
-    def validate_vehicle(self, value):
-        if self.instance and self.instance.vehicle_id == (value.pk if value else None):
+    @staticmethod
+    def vehicle_name(vehicle):
+        return " ".join(
+            str(value) for value in (
+                vehicle.manufacture_year,
+                vehicle.make,
+                vehicle.model,
+                vehicle.variant,
+            ) if value
+        )
+
+    def get_vehicle_description(self, obj):
+        if obj.vehicle_id:
+            return self.vehicle_name(obj.vehicle)
+        return obj.vehicle_description
+
+    def validate_vehicle_id(self, value):
+        if self.instance and self.instance.vehicle_id == value.pk:
             return value
-        if value and value.status != Vehicle.Status.AVAILABLE:
-            raise serializers.ValidationError("Link only an available vehicle to an import order.")
-        if self.instance and self.instance.vehicle_id != (value.pk if value else None) and self.instance.sales.exists():
-            raise serializers.ValidationError("The vehicle link cannot change after a sale has been created.")
+
+        if self.instance and self.instance.sales.exists():
+            raise serializers.ValidationError(
+                "The vehicle link cannot change after a sale has been created."
+            )
+
+        if (
+            value.status != Vehicle.Status.AVAILABLE
+            or value.visibility != Vehicle.Visibility.DRAFT
+        ):
+            raise serializers.ValidationError(
+                "Select an available draft vehicle from inventory."
+            )
+
+        existing = ImportOrder.objects.filter(vehicle=value)
+
+        if self.instance:
+            existing = existing.exclude(pk=self.instance.pk)
+
+        if existing.exists():
+            raise serializers.ValidationError(
+                "This vehicle is already linked to another import."
+            )
+
+        if value.sales.exists():
+            raise serializers.ValidationError(
+                "This vehicle is already linked to a sale."
+            )
+
         return value
 
-    def get_fields(self):
-        fields = super().get_fields()
-        request = self.context.get("request")
-        if request and getattr(request.user, "role", None) != User.Role.STAFF:
-            for name in ("internal_notes", "vehicle_details"):
-                fields.pop(name, None)
-        return fields
+    def validate(self, attrs):
+        vehicle = attrs.get(
+            "vehicle",
+            self.instance.vehicle if self.instance else None,
+        )
+
+        if vehicle is None:
+            raise serializers.ValidationError({
+                "vehicle_id": "A linked inventory vehicle is required."
+            })
+
+        if "vehicle" in attrs:
+            attrs["vehicle_description"] = self.vehicle_name(vehicle)[:240]
+
+        return attrs
 
 
 class ImportMilestoneCreateSerializer(serializers.Serializer):

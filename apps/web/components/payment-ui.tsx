@@ -170,10 +170,24 @@ export default function StaffPayments() {
   const idempotencyKey = useRef("");
 
   useEffect(() => {
+    if (!user) return;
+
     const params = new URLSearchParams(window.location.search);
-    const type = params.get("target_type"); if (type === "sale" || type === "reservation" || type === "import") { setTargetType(type); setShowForm(true); }
-    setReference(params.get("reference") || "");
-  }, []);
+    const type = params.get("target_type");
+
+    if (type === "import" && user.role !== "ceo") {
+      setTargetType("sale");
+      setReference("");
+      setShowForm(false);
+      return;
+    }
+
+    if (type === "sale" || type === "reservation" || type === "import") {
+      setTargetType(type);
+      setReference(params.get("reference") || "");
+      setShowForm(true);
+    }
+  }, [user?.role]);
 
   const load = useCallback(async () => {
     if (!user) return;
@@ -206,16 +220,19 @@ export default function StaffPayments() {
   useEffect(() => { if (showForm && reference) void refreshTargetSummary(targetType, reference); /* prefilled target */ }, [showForm]);
   const canRecord = user?.role === "manager" || user?.role === "ceo";
   const canReview = user?.role === "manager" || user?.role === "ceo";
+  const canRecordTarget = canRecord && (
+    targetType !== "import" || user?.role === "ceo"
+  );
   const pendingAllowance = Number(formSummary?.outstanding_balance_lkr || 0);
   const amountInvalid = !amount || !Number.isFinite(Number(amount)) || Number(amount) <= 0 || (paymentMethod !== "cash" && !fundsCleared) || (formSummary?.outstanding_balance_lkr != null && Number(amount) > Math.max(0, pendingAllowance));
 
   async function submit(e: React.FormEvent) {
-    e.preventDefault(); if (submitLock.current || amountInvalid || !reference.trim()) return;
+    e.preventDefault(); if (!canRecordTarget || submitLock.current || amountInvalid || !reference.trim()) return;
     setConfirmSubmit(true);
   }
 
   async function confirmRecord() {
-    if (submitLock.current || amountInvalid || !reference.trim()) return;
+    if (!canRecordTarget || submitLock.current || amountInvalid || !reference.trim()) return;
     submitLock.current = true;
     setBusy(true); setError(""); setNotice("");
     try {
@@ -253,10 +270,10 @@ export default function StaffPayments() {
   return <div className="payments-page">
     <div className="payments-title-row"><div><p className="eyebrow">PAYMENT OPERATIONS</p><h2>Payments directory</h2><p>Manage confirmed transactions and outstanding customer balances.</p></div>{canRecord && <button className="primary-button" onClick={() => { setShowForm((v) => !v); setError(""); }}>+ Record payment</button>}</div>
     {error && <p className="reservation-feedback is-error" role="alert">{error}</p>}{notice && <p className="reservation-feedback" role="status">{notice}</p>}
-    {dashboard && <div className="payment-kpi-grid"><article><span>Total payments received</span><strong>{money(dashboard.verified_amount_lkr)}</strong></article><article><span>Outstanding receivables</span><strong>{money(dashboard.outstanding_receivables_lkr || 0)}</strong></article><article><span>Fully settled sales</span><strong>{dashboard.fully_settled_count || 0}</strong></article><article><span>Partially settled sales</span><strong>{dashboard.partially_settled_count || 0}</strong></article><article><span>Outstanding finance settlement</span><strong>{money(dashboard.outstanding_finance_settlement_lkr || 0)}</strong></article></div>}
+    {dashboard && <div className="payment-kpi-grid"><article><span>Total payments received</span><strong>{money(dashboard.verified_amount_lkr)}</strong></article><article><span>Outstanding receivables</span><strong>{money(dashboard.outstanding_receivables_lkr || 0)}</strong></article><article><span>Fully settled sales</span><strong>{dashboard.fully_settled_count || 0}</strong></article><article><span>Partially settled sales</span><strong>{dashboard.partially_settled_count || 0}</strong></article>{user?.role === "ceo" && <article><span>Outstanding confirmed import balances</span><strong>{money(dashboard.outstanding_finance_settlement_lkr || 0)}</strong></article>}</div>}
     {showForm && canRecord && <form className="reservation-form payment-form" onSubmit={submit}>
       <div className="reservation-form-heading"><div><p className="eyebrow">NEW PAYMENT</p><h2>Record payment</h2></div><button type="button" className="inventory-secondary" onClick={() => setShowForm(false)}>Close</button></div>
-      <div className="payment-target-switch" role="group" aria-label="Payment target"><button type="button" className={targetType === "sale" ? "is-active" : ""} onClick={() => { setTargetType("sale"); setFormSummary(null); setFormPayments([]); }}>Sale</button><button type="button" className={targetType === "reservation" ? "is-active" : ""} onClick={() => { setTargetType("reservation"); setFormSummary(null); setFormPayments([]); }}>Reservation</button><button type="button" className={targetType === "import" ? "is-active" : ""} onClick={() => { setTargetType("import"); setFormSummary(null); setFormPayments([]); }}>Import Order</button></div>
+      <div className="payment-target-switch" role="group" aria-label="Payment target"><button type="button" className={targetType === "sale" ? "is-active" : ""} onClick={() => { setTargetType("sale"); setFormSummary(null); setFormPayments([]); }}>Sale</button><button type="button" className={targetType === "reservation" ? "is-active" : ""} onClick={() => { setTargetType("reservation"); setFormSummary(null); setFormPayments([]); }}>Reservation</button>{user?.role === "ceo" && <button type="button" className={targetType === "import" ? "is-active" : ""} onClick={() => { setTargetType("import"); setFormSummary(null); setFormPayments([]); }}>Import Order</button>}</div>
       {formSummary && <section className="payment-transaction-card">{formSummary.vehicle_image_url ? <img src={`${API}${formSummary.vehicle_image_url}`} alt={formSummary.vehicle_name || "Vehicle"} onError={(event) => { event.currentTarget.style.display = "none"; }} /> : <div className="payment-vehicle-placeholder" aria-label="No vehicle image available">SSP</div>}<div className="payment-transaction-info"><div><h3>{formSummary.vehicle_name || (targetType === "import" ? "Personal import" : "Vehicle details unavailable")}</h3><span>{targetType === "sale" ? "Sale" : targetType === "reservation" ? "Reservation" : "Import"} reference: {reference}</span></div><dl><div><dt>Customer</dt><dd>{formSummary.customer_name || "—"}</dd></div><div><dt>Date</dt><dd>{formSummary.transaction_date || "—"}</dd></div><div><dt>Type</dt><dd>{formSummary.transaction_type || targetType}</dd></div></dl></div></section>}
       <div className="reservation-form-grid">
         <label>{targetType === "sale" ? "Sale reference" : targetType === "reservation" ? "Reservation reference" : "Import reference"} *<div className="payment-reference-field"><input required value={reference} onChange={(e) => { setReference(e.target.value); setFormSummary(null); setFormPayments([]); }} onBlur={() => void refreshTargetSummary()} placeholder={targetType === "sale" ? "e.g. SAL-0001" : targetType === "reservation" ? "e.g. RSV-0001" : "e.g. IMP-…"}/><button type="button" className="inventory-secondary" disabled={!reference.trim()} onClick={() => void refreshTargetSummary()}>Check balance</button></div></label>
@@ -277,7 +294,7 @@ export default function StaffPayments() {
         {summaryError && <p className="reservation-wide reservation-feedback is-error" role="alert">{summaryError}</p>}
         {formSummary?.outstanding_balance_lkr != null && Number(amount) > Math.max(0, pendingAllowance) && Number(amount) > 0 && <p className="reservation-wide payment-field-error">Amount exceeds the current outstanding balance.</p>}
       </div><aside className="payment-settlement-preview"><h3>Settlement Summary</h3>{formSummary ? <><div><span>Total payable</span><strong>{(formSummary.sale_price_lkr ?? formSummary.agreed_price_lkr) == null ? "—" : money(formSummary.sale_price_lkr ?? formSummary.agreed_price_lkr ?? 0)}</strong></div><div><span>Confirmed payments</span><strong>{money(formSummary.verified_received_lkr || formSummary.verified_amount_lkr || 0)}</strong></div><div className="is-outstanding"><span>Outstanding balance</span><strong>{formSummary.outstanding_balance_lkr == null ? "Not available" : money(formSummary.outstanding_balance_lkr)}</strong></div><div><span>Projected after payment</span><strong>{formSummary.outstanding_balance_lkr == null ? "—" : money(Math.max(0, pendingAllowance - Number(amount || 0)))}</strong></div><div className="payment-progress"><span style={{ width: `${Math.min(100, Number((formSummary.sale_price_lkr ?? formSummary.agreed_price_lkr) ? (Number(formSummary.verified_received_lkr ?? formSummary.verified_amount_lkr ?? 0) / Number(formSummary.sale_price_lkr ?? formSummary.agreed_price_lkr)) * 100 : 0))}%` }} /></div><div className="payment-history"><h4>Previous Payments</h4>{formPayments.length ? <div className="payment-history-list">{formPayments.slice(0, 4).map((payment) => <article key={payment.reference}><div><strong>{payment.payment_date}</strong><span className={`payment-status is-${payment.status}`}>{statusTitle(payment.status)}</span></div><p>{paymentTypeTitle(payment.payment_type)} · {money(payment.amount_lkr)}</p><small>{payment.method.replaceAll("_", " ")}{payment.transaction_reference ? ` · ${payment.transaction_reference}` : ""}</small></article>)}</div> : <p>No previous payments for this transaction.</p>}</div></> : <p>Enter a sale, reservation or import reference to load the current settlement.</p>}</aside><p className="payment-note">The payment is confirmed immediately when recorded. The balance preview updates after the server accepts the transaction.</p>
-      <button className="primary-button" disabled={busy || amountInvalid || !reference.trim()}>{busy ? "Recording…" : "Confirm & Record Payment"}</button>
+      <button className="primary-button" disabled={!canRecordTarget || busy || amountInvalid || !reference.trim()}>{busy ? "Recording…" : "Confirm & Record Payment"}</button>
     </form>}
     {confirmSubmit && <div className="reservation-dialog-backdrop" role="presentation"><section className="reservation-dialog" role="dialog" aria-modal="true" aria-labelledby="payment-confirm-title"><p className="eyebrow">CONFIRM TRANSACTION</p><h2 id="payment-confirm-title">Confirm & Record Payment?</h2><p>This records the LKR {amount} payment as confirmed immediately and updates the outstanding balance.</p><dl><div><dt>Transaction</dt><dd>{reference}</dd></div><div><dt>Payment method</dt><dd>{paymentMethod.replaceAll("_", " ")}</dd></div><div><dt>Projected outstanding</dt><dd>{formSummary?.outstanding_balance_lkr == null ? "—" : money(Math.max(0, pendingAllowance - Number(amount || 0)))}</dd></div></dl><footer><button type="button" className="inventory-secondary" disabled={busy} onClick={() => setConfirmSubmit(false)}>Cancel</button><button type="button" className="primary-button" disabled={busy} onClick={() => void confirmRecord()}>{busy ? "Recording…" : "Confirm & Record Payment"}</button></footer></section></div>}
     <div className="payments-filters"><label>Search<input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Payment, sale, reservation, import or customer"/></label><label>Status<select value={status} onChange={(e) => setStatus(e.target.value)}><option value="">All statuses</option><option value="pending">Legacy pending</option><option value="verified">Verified</option><option value="rejected">Rejected</option></select></label><label>Method<select value={method} onChange={(e) => setMethod(e.target.value)}><option value="">All methods</option><option value="cash">Cash</option><option value="bank_transfer">Bank transfer</option><option value="cheque">Cheque</option><option value="other">Other</option></select></label><label>From<input type="date" value={fromDate} onChange={(e) => setFromDate(e.target.value)}/></label><label>To<input type="date" value={toDate} onChange={(e) => setToDate(e.target.value)}/></label><span>{rows.length} records · latest 250</span></div>

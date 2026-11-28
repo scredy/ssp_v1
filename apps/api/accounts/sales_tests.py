@@ -47,6 +47,8 @@ class SalesApiTests(APITestCase):
         self.assertTrue(AuditEvent.objects.filter(action="sale.confirmed", subject=response.data["reference"]).exists())
 
     def test_import_order_requires_registered_ready_stock_then_completes_sale_payment_handover_and_commission(self):
+        self.vehicle.visibility = Vehicle.Visibility.DRAFT
+        self.vehicle.save(update_fields=["visibility"])
         rep_user = User.objects.create_user(username="import-sale-rep", password="Test-pass-912!", role=User.Role.REP)
         rep = RepresentativeProfile.objects.create(user=rep_user)
         self.client.force_authenticate(self.staff)
@@ -63,7 +65,7 @@ class SalesApiTests(APITestCase):
         self.assertEqual(order.vehicle_id, self.vehicle.pk)
         self.assertEqual(order.status, ImportOrder.Status.NEW)
 
-        self.client.force_authenticate(self.manager)
+        self.client.force_authenticate(self.ceo)
         sale_payload = {"sale_type": "import", "import_reference": order_ref, "representative_id": rep.pk,
                         "agreed_price_lkr": "9750000.00", "sale_date": "2026-11-21"}
         blocked = self.client.post("/api/manager/sales/", sale_payload, format="json")
@@ -72,10 +74,26 @@ class SalesApiTests(APITestCase):
 
         milestone_url = f"/api/staff/imports/{order_ref}/milestones/"
         self.client.force_authenticate(self.staff)
-        for kind, description in (("booking_confirmed", "Fictional booking confirmed."),
-                                  ("lc_opened", "Fictional letter of credit opened.")):
+        booking = self.client.post(milestone_url, {
+            "kind": "booking_confirmed",
+            "customer_description": "Fictional booking confirmed.",
+        }, format="json")
+        self.assertEqual(booking.status_code, 201, booking.data)
+
+        self.client.force_authenticate(self.ceo)
+        advance = self.client.post("/api/staff/payments/", {
+            "import_reference": order_ref,
+            "amount_lkr": "100000.00",
+            "method": "cash",
+            "payment_type": "advance",
+            "idempotency_key": "import-sale-integration-advance",
+        }, format="json")
+        self.assertEqual(advance.status_code, 201, advance.data)
+
+        for kind, description in (("lc_opened", "Fictional letter of credit opened."),):
             response = self.client.post(milestone_url, {"kind": kind, "customer_description": description}, format="json")
             self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.client.force_authenticate(self.staff)
         approval = self.client.post(f"/api/staff/imports/{order_ref}/bl-requests/",
                                     {"request_note": "Fictional carrier document ready."}, format="json")
         self.assertEqual(approval.status_code, status.HTTP_201_CREATED, approval.data)
@@ -83,7 +101,7 @@ class SalesApiTests(APITestCase):
         decision = self.client.post(f"/api/staff/bl-requests/{approval.data['id']}/decision/",
                                     {"decision": "approved"}, format="json")
         self.assertEqual(decision.status_code, status.HTTP_200_OK, decision.data)
-        self.client.force_authenticate(self.staff)
+        self.client.force_authenticate(self.ceo)
         for kind, description in (("bl_issued", "Fictional bill of lading issued."),
                                   ("shipping", "Fictional shipment departed."),
                                   ("arrival", "Fictional vehicle arrived."),
@@ -97,17 +115,25 @@ class SalesApiTests(APITestCase):
         self.assertEqual(self.vehicle.status, Vehicle.Status.AVAILABLE)
 
         self.client.force_authenticate(self.manager)
+        denied = self.client.post("/api/manager/sales/", sale_payload, format="json")
+        self.assertEqual(denied.status_code, 403)
+
+        self.client.force_authenticate(self.ceo)
         sale = self.client.post("/api/manager/sales/", sale_payload, format="json")
         self.assertEqual(sale.status_code, status.HTTP_201_CREATED, sale.data)
         self.assertEqual(sale.data["customer_id"], self.customer.pk)
         self.assertEqual(sale.data["vehicle_reference"], self.vehicle.reference)
+        self.client.force_authenticate(self.manager)
+        self.assertEqual(self.client.post(f"/api/manager/sales/{sale.data['reference']}/confirm/", {}, format="json").status_code, 403)
+
+        self.client.force_authenticate(self.ceo)
         confirmed = self.client.post(f"/api/manager/sales/{sale.data['reference']}/confirm/", {}, format="json")
         self.assertEqual(confirmed.status_code, status.HTTP_200_OK, confirmed.data)
         self.vehicle.refresh_from_db()
         self.assertEqual(self.vehicle.status, Vehicle.Status.SOLD)
 
         payment = self.client.post("/api/staff/payments/", {
-            "sale_reference": sale.data["reference"], "amount_lkr": "2500000.00", "method": "bank_transfer",
+            "sale_reference": sale.data["reference"], "amount_lkr": "2400000.00", "method": "bank_transfer",
             "transaction_reference": "IMPORT-SALE-INTEGRATION-PAYMENT", "idempotency_key": "import-sale-integration-payment",
             "payment_date": "2026-11-21", "funds_cleared": True,
         }, format="json")
@@ -297,7 +323,10 @@ class SalesApiTests(APITestCase):
             self.assertEqual(self.client.get("/api/manager/sales/").status_code, status.HTTP_200_OK)
         self.client.force_authenticate(self.ceo)
         self.assertEqual(self.client.post("/api/manager/sales/", self.payload(), format="json").status_code, status.HTTP_403_FORBIDDEN)
-        self.assertEqual(self.client.get("/api/manager/sales/options/").status_code, status.HTTP_403_FORBIDDEN)
+        options = self.client.get("/api/manager/sales/options/")
+        self.assertEqual(options.status_code, 200)
+        self.assertEqual(options.data["vehicles"], [])
+        self.assertEqual(options.data["reservations"], [])
         self.client.force_authenticate(self.staff)
         self.assertEqual(self.client.get("/api/manager/sales/summary/").status_code, status.HTTP_200_OK)
         self.assertEqual(self.client.get("/api/manager/sales/").status_code, status.HTTP_403_FORBIDDEN)

@@ -74,6 +74,27 @@ async function selectOptionContaining(select, text) {
   await select.selectOption(value);
 }
 
+async function importApi(page, path, method = 'GET', body) {
+  return page.evaluate(async ({ path, method, body }) => {
+    const csrf = document.cookie.split('; ').find(x => x.startsWith('csrftoken='))?.split('=')[1] || '';
+    const headers = { 'X-CSRFToken': decodeURIComponent(csrf) };
+    if (body !== undefined) headers['Content-Type'] = 'application/json';
+
+    const response = await fetch(path, {
+      method,
+      credentials: 'same-origin',
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+
+    let data;
+    try { data = await response.json(); }
+    catch { data = await response.text(); }
+
+    return { status: response.status, data };
+  }, { path, method, body });
+}
+
 test.describe.configure({ mode: 'serial' });
 
 test('Admin onboarding, invitations, password setup/reset, and audit', async ({ browser }, info) => {
@@ -553,18 +574,23 @@ test('Staff reservations, payments, imports, tracking, and notifications', async
     }
     if (!state.importOrder) {
       await step(page, 'Staff', 'Create fictional import order', 'Import is linked to a customer and available vehicle; no stock sale is implied', async () => {
+        const stock = await importApi(page, `/api/staff/inventory/${state.vehicles[2].reference}/`, 'PATCH', {
+          visibility: 'draft',
+        });
+        expect(stock.status, JSON.stringify(stock.data)).toBe(200);
+
         await page.goto('/staff/imports');
         await page.getByRole('button', { name: '+ Create import' }).click();
         const form = page.locator('form.import-form');
         await selectOptionContaining(form.getByLabel('Customer *'), 'Ruwan Silva');
-        await selectOptionContaining(form.getByLabel('Linked vehicle (optional)'), state.vehicles[2].reference);
-        await form.getByLabel('Vehicle description *').fill('2024 Mazda CX-5 XD L Package');
+        await expect(form.getByLabel('Vehicle description *')).toHaveCount(0);
+        await selectOptionContaining(form.getByLabel('Linked draft vehicle *'), state.vehicles[2].reference);
         await form.getByLabel('Country of origin *').fill('Japan');
         await form.getByLabel('Vehicle details').fill('Fictional Japanese import order for acceptance tests.');
         await form.getByLabel('Estimated arrival').fill('2026-12-18');
         await form.getByLabel('Shipping information').fill('Test vessel SSP-E2E-04; no real shipment.');
         await form.getByLabel('Customer-visible update').fill('Fictional order received; status updates will appear here.');
-        await form.getByLabel('Internal notes · staff only').fill('Test-only import record.');
+        await form.getByLabel(/Internal notes/i).fill('Test-only import record.');
         await form.getByRole('button', { name: 'Save import' }).click();
         await expect(page.getByRole('status')).toContainText('Import IMP-');
         state.importOrder = (await page.locator('.import-detail h3').first().innerText()).trim();
@@ -574,7 +600,14 @@ test('Staff reservations, payments, imports, tracking, and notifications', async
     }
 
     if (!state.tracking) {
-      await step(page, 'Staff', 'Issue secure import-tracking credentials', 'Tracking access is created and one-time PIN is visible only to Staff', async () => {
+      await step(page, 'CEO', 'Issue secure import-tracking credentials', 'Staff cannot issue credentials; CEO receives the one-time PIN', async () => {
+        await expect(page.getByRole('button', { name: 'Issue / rotate tracking access' })).toHaveCount(0);
+
+        await logout(page);
+        await login(page, 'CEO', state.ceo);
+        await page.goto('/staff/imports');
+        await page.getByRole('row').filter({ hasText: state.importOrder }).click();
+
         page.once('dialog', (dialog) => dialog.accept());
         await page.getByRole('button', { name: 'Issue / rotate tracking access' }).click();
         const issued = page.locator('.import-pin-issued');
@@ -583,7 +616,13 @@ test('Staff reservations, payments, imports, tracking, and notifications', async
         const referenceText = await issued.locator('span').innerText();
         const trackingReference = referenceText.replace('Tracking reference:', '').trim();
         state.tracking = { pin, reference: trackingReference };
-        return `Issued ${trackingReference}; one-time PIN displayed to staff.`;
+        await issued.getByRole('button', { name: 'Close and clear PIN' }).click();
+        await expect(issued).toHaveCount(0);
+
+        await logout(page);
+        await login(page, 'Staff', state.staff);
+
+        return `CEO issued ${trackingReference}; one-time PIN cleared after capture.`;
       });
       writeState(state);
     }
@@ -608,16 +647,44 @@ test('Staff reservations, payments, imports, tracking, and notifications', async
         await milestoneForm.getByLabel('Customer-safe description *').fill('Fictional vehicle booking confirmed.');
         await milestoneForm.getByRole('button', { name: 'Add milestone' }).click();
         await expect(page.getByRole('status')).toContainText('Milestone recorded');
+        await expect(page.getByRole('button', { name: 'Request BL approval' })).toHaveCount(0);
+
+        await logout(page);
+        await login(page, 'CEO', state.ceo);
+
+        const advance = await importApi(page, '/api/staff/payments/', 'POST', {
+          import_reference: state.importOrder,
+          amount_lkr: '1000000.00',
+          method: 'cash',
+          payment_type: 'advance',
+          idempotency_key: 'pw-import-advance-001',
+        });
+
+        expect(advance.status, JSON.stringify(advance.data)).toBe(201);
+        expect(advance.data.status).toBe('verified');
+        state.importAdvance = advance.data.reference;
+        writeState(state);
+
+        await page.goto('/staff/imports');
+        await page.getByRole('row').filter({ hasText: state.importOrder }).click();
+
         await milestoneForm.getByLabel('Milestone').selectOption('lc_opened');
         await milestoneForm.getByLabel('Customer-safe description *').fill('Fictional letter of credit opened.');
         await milestoneForm.getByRole('button', { name: 'Add milestone' }).click();
         await expect(page.getByRole('status')).toContainText('Milestone recorded');
+
+        await logout(page);
+        await login(page, 'Staff', state.staff);
+        await page.goto('/staff/imports');
+        await page.getByRole('row').filter({ hasText: state.importOrder }).click();
+
         const blForm = page.locator('.import-bl-section form');
+        await expect(blForm).toBeVisible();
         await blForm.getByLabel('Request note').fill('Fictional documents ready for review.');
         await blForm.getByRole('button', { name: 'Request BL approval' }).click();
         await expect(page.getByRole('status')).toContainText('BL approval request submitted to the CEO');
         state.blRequest = true;
-        return 'Booking and LC milestones recorded; BL approval request submitted to CEO.';
+        return 'Staff booking, CEO-confirmed advance and CEO LC recorded; Staff submitted BL request.';
       });
       writeState(state);
     }
@@ -678,7 +745,7 @@ test('CEO BL approval, commission policy, and Manager oversight', async ({ brows
     });
 
     if (!state.blApproved) {
-      await step(page, 'CEO', 'Approve staff BL request', 'CEO approval changes request state; BL issuance remains a separate Staff milestone', async () => {
+      await step(page, 'CEO', 'Approve staff BL request', 'CEO approval changes request state; BL issuance remains a separate CEO milestone', async () => {
         await page.goto('/staff/bl-requests');
         await expect(page.getByRole('heading', { name: /BL Requests/i })).toBeVisible();
         await page.getByRole('row').filter({ hasText: state.importOrder }).click();
@@ -718,11 +785,17 @@ test('CEO BL approval, commission policy, and Manager oversight', async ({ brows
       return 'CEO leadership oversight view and Manager activity filters loaded.';
     });
 
-    await step(page, 'CEO', 'Check read-only sales permissions', 'CEO can inspect sales but cannot create or confirm them', async () => {
+    await step(page, 'CEO', 'Check import sales permissions', 'CEO can create import sales but not ordinary direct sales', async () => {
       await page.goto('/staff/sales');
       await expect(page.getByRole('heading', { name: 'Sales' })).toBeVisible();
-      await expect(page.getByRole('button', { name: '+ New sale' })).toHaveCount(0);
-      return 'Sales review is available with no New sale control for CEO.';
+      await expect(page.getByRole('button', { name: '+ New sale' })).toBeVisible();
+
+      const options = await importApi(page, '/api/manager/sales/options/');
+      expect(options.status).toBe(200);
+      expect(options.data.vehicles).toEqual([]);
+      expect(options.data.reservations).toEqual([]);
+
+      return 'CEO import sale controls available; direct sale options restricted.';
     });
   } finally {
     await context.tracing.stop({ path: testInfoOutput(info, 'ceo-oversight-policy-trace.zip') });

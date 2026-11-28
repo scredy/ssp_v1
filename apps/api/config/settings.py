@@ -198,6 +198,99 @@ if not DEBUG:
             "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
         },
     }
+# Keep filesystem storage as the default for development and tests.
+SSP_STORAGE_BACKEND = os.environ.get("SSP_STORAGE_BACKEND", "local").strip().lower()
+
+if SSP_STORAGE_BACKEND not in {"local", "r2"}:
+    raise RuntimeError("SSP_STORAGE_BACKEND must be local or r2.")
+
+if SSP_STORAGE_BACKEND == "r2":
+    from urllib.parse import urlsplit
+    from botocore.config import Config
+
+    required_r2_variables = (
+        "R2_ENDPOINT_URL",
+        "R2_ACCESS_KEY_ID",
+        "R2_SECRET_ACCESS_KEY",
+        "R2_VEHICLE_BUCKET",
+        "R2_PRIVATE_BUCKET",
+    )
+
+    missing_r2_variables = [
+        name for name in required_r2_variables
+        if not os.environ.get(name, "").strip()
+    ]
+
+    if missing_r2_variables:
+        raise RuntimeError(
+            "Missing R2 configuration: " + ", ".join(missing_r2_variables)
+        )
+
+    endpoint = os.environ["R2_ENDPOINT_URL"].strip().rstrip("/")
+    parsed_endpoint = urlsplit(endpoint)
+
+    if (
+        parsed_endpoint.scheme != "https"
+        or not parsed_endpoint.hostname
+        or not parsed_endpoint.hostname.endswith(".r2.cloudflarestorage.com")
+        or parsed_endpoint.path
+        or parsed_endpoint.query
+        or parsed_endpoint.fragment
+        or parsed_endpoint.username
+        or parsed_endpoint.password
+    ):
+        raise RuntimeError("Invalid Cloudflare R2 endpoint.")
+
+    if os.environ["R2_VEHICLE_BUCKET"] == os.environ["R2_PRIVATE_BUCKET"]:
+        raise RuntimeError("Vehicle and private document buckets must differ.")
+
+    r2_options = {
+        "access_key": os.environ["R2_ACCESS_KEY_ID"],
+        "secret_key": os.environ["R2_SECRET_ACCESS_KEY"],
+        "endpoint_url": endpoint,
+        "region_name": "auto",
+        "default_acl": None,
+        "querystring_auth": True,
+        "file_overwrite": False,
+        "max_memory_size": 1024 * 1024,
+        "object_parameters": {
+            "CacheControl": "private, no-store",
+        },
+        "client_config": Config(
+            signature_version="s3v4",
+            connect_timeout=5,
+            read_timeout=30,
+            retries={"mode": "standard", "max_attempts": 3},
+            request_checksum_calculation="when_required",
+            response_checksum_validation="when_required",
+            s3={"addressing_style": "path"},
+        ),
+    }
+
+    STORAGES = {
+        "default": {
+            "BACKEND": "accounts.storage_backends.PrivateR2Storage",
+            "OPTIONS": {
+                **r2_options,
+                "bucket_name": os.environ["R2_VEHICLE_BUCKET"],
+            },
+        },
+        "private_documents": {
+            "BACKEND": "accounts.storage_backends.PrivateR2Storage",
+            "OPTIONS": {
+                **r2_options,
+                "bucket_name": os.environ["R2_PRIVATE_BUCKET"],
+            },
+        },
+        "staticfiles": {
+            "BACKEND": (
+                "django.contrib.staticfiles.storage.StaticFilesStorage"
+                if DEBUG else
+                "whitenoise.storage.CompressedManifestStaticFilesStorage"
+            ),
+        },
+    }
+
 CSRF_FAILURE_VIEW = "accounts.security.csrf_failure"
 DATA_UPLOAD_MAX_NUMBER_FILES = 10
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"

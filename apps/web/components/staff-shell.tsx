@@ -29,7 +29,7 @@ const displayRoleName = (user: User) => user.is_superuser ? "Superuser" : roleNa
 const menus: Record<string, MenuItem[]> = {
   admin: [{ label: "Dashboard", href: "/staff" }, { label: "Users", href: "/staff/accounts" }, { label: "Account activity", href: "/staff/activity" }],
   ceo: [{ label: "Overview", href: "/staff" }, { label: "Sales", href: "/staff/sales" }, { label: "Payments", href: "/staff/payments" }, { label: "Handovers", href: "/staff/handovers" }, { label: "Commission policy", href: "/staff/commission-rules" }, { label: "Quotations", href: "/staff/quotations" }, { label: "Imports", href: "/staff/imports" }, { label: "BL Requests", href: "/staff/bl-requests" }, { label: "Inventory", href: "/staff/inventory" }, { label: "Reservations", href: "/staff/reservations" }, { label: "Representatives", href: "/staff/reps" }, { label: "Enquiries", href: "/staff/enquiries" }, { label: "Customers", href: "/staff/customers" }, { label: "Leadership oversight", href: "/staff/oversight/managers" }],
-  manager: [{ label: "Dashboard", href: "/staff" }, { label: "Sales", href: "/staff/sales" }, { label: "Payments", href: "/staff/payments" }, { label: "Handovers", href: "/staff/handovers" }, { label: "Commission policy", href: "/staff/commission-rules" }, { label: "Quotations", href: "/staff/quotations" }, { label: "Imports", href: "/staff/imports" }, { label: "Inventory", href: "/staff/inventory" }, { label: "Reservations", href: "/staff/reservations" }, { label: "Representatives", href: "/staff/reps" }, { label: "Enquiries", href: "/staff/enquiries" }, { label: "Customers", href: "/staff/customers" }],
+  manager: [{ label: "Dashboard", href: "/staff" }, { label: "Sales", href: "/staff/sales" }, { label: "Payments", href: "/staff/payments" }, { label: "Handovers", href: "/staff/handovers" }, { label: "Commission policy", href: "/staff/commission-rules" }, { label: "Quotations", href: "/staff/quotations" }, { label: "Inventory", href: "/staff/inventory" }, { label: "Reservations", href: "/staff/reservations" }, { label: "Representatives", href: "/staff/reps" }, { label: "Enquiries", href: "/staff/enquiries" }, { label: "Customers", href: "/staff/customers" }],
   staff: [{ label: "Dashboard", href: "/staff" }, { label: "Inventory", href: "/staff/inventory" }, { label: "Reservations", href: "/staff/reservations" }, { label: "Handovers", href: "/staff/handovers" }, { label: "Imports", href: "/staff/imports" }, { label: "Quotations", href: "/staff/quotations" }, { label: "Enquiries", href: "/staff/enquiries" }, { label: "Customers", href: "/staff/customers" }, { label: "Sales summary", href: "/staff/sales-summary" }],
   rep: [{ label: "Dashboard", href: "/staff" }, { label: "My sales", href: "/staff/my-sales" }, { label: "My commissions", href: "/staff/my-commissions" }],
 };
@@ -40,7 +40,7 @@ const routeRoles: [string, string[]][] = [
   ["/staff/commissions", ["ceo", "manager"]],
   ["/staff/payments", ["manager", "ceo"]],
   ["/staff/quotations", ["staff", "manager", "ceo"]],
-  ["/staff/imports", ["staff", "manager", "ceo"]], ["/staff/bl-requests", ["ceo"]],
+  ["/staff/imports", ["staff", "ceo"]], ["/staff/bl-requests", ["ceo"]],
   ["/staff/handovers", ["staff", "manager", "ceo"]],
   ["/staff/reps", ["manager", "ceo"]], ["/staff/sales-summary", ["staff", "manager", "ceo"]],
   ["/staff/sales", ["manager", "ceo"]], ["/staff/inventory", ["staff", "manager", "ceo"]],

@@ -214,7 +214,11 @@ class StaffEnquiryListView(APIView):
         search = request.query_params.get("search", "").strip()
         if kind: items = items.filter(kind=kind)
         if status_filter: items = items.filter(status=status_filter)
-        if search: items = items.filter(Q(reference__icontains=search) | Q(customer__full_name__icontains=search) | Q(customer__phone__icontains=search) | Q(customer__email__icontains=search) | Q(vehicle__reference__icontains=search) | Q(vehicle_description__icontains=search))
+        if search: items = items.filter(Q(reference__icontains=search) | Q(customer__full_name__icontains=search) | Q(customer__phone__icontains=search) | Q(customer__email__icontains=search) | Q(vehicle__reference__icontains=search) |
+            Q(vehicle__make__icontains=search) |
+            Q(vehicle__model__icontains=search) |
+            Q(vehicle__variant__icontains=search) |
+            Q(vehicle_description__icontains=search))
         return Response(StaffEnquirySerializer(items[:250], many=True).data)
 
 
@@ -451,11 +455,23 @@ SYSTEM_NOTIFICATION_Q = (Q(deduplication_key__istartswith="system:") |
                          Q(title__icontains="system") | Q(message__icontains="system"))
 
 
+def visible_notifications_for_user(user):
+    notifications = Notification.objects.filter(recipient=user)
+
+    if user.role == User.Role.MANAGER:
+        notifications = notifications.exclude(
+            Q(target_url__startswith="/staff/imports")
+            | Q(target_url__startswith="/staff/bl-requests")
+        )
+
+    return notifications
+
+
 class NotificationCollectionView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        notifications = Notification.objects.filter(recipient=request.user).order_by("-created_at", "-pk")
+        notifications = visible_notifications_for_user(request.user).order_by("-created_at", "-pk")
         stats = notifications.aggregate(
             all_count=Count("pk"),
             unread_count=Count("pk", filter=Q(read_at__isnull=True)),
@@ -510,7 +526,7 @@ class NotificationDetailView(APIView):
         serializer = NotificationReadSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         notification = get_object_or_404(
-            Notification.objects.select_for_update().filter(recipient=request.user), pk=notification_id,
+            visible_notifications_for_user(request.user).select_for_update(), pk=notification_id,
         )
         is_read = serializer.validated_data["is_read"]
         notification.read_at = (notification.read_at or timezone.now()) if is_read else None
@@ -1183,6 +1199,11 @@ class ManagerSalesView(APIView):
 
     def get(self, request):
         sales = self.get_queryset()
+
+        if request.user.role == User.Role.MANAGER:
+            sales = sales.exclude(
+                pk__in=import_sale_queryset().values("pk")
+            )
         query = request.query_params.get("search", "").strip()
         status_filter = request.query_params.get("status", "")
         sale_type = request.query_params.get("sale_type", "")
@@ -1201,6 +1222,20 @@ class ManagerSalesView(APIView):
         serializer = SaleCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+
+        import_sale = data["sale_type"] == Sale.SaleType.IMPORT
+
+        if import_sale and request.user.role != User.Role.CEO:
+            return Response(
+                {"detail": "Only the CEO may create import sales."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if not import_sale and request.user.role != User.Role.MANAGER:
+            return Response(
+                {"detail": "Normal vehicle sales are managed by the MD."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         try:
             with transaction.atomic():
                 reservation = None
@@ -1240,6 +1275,12 @@ class ManagerSalesView(APIView):
                         vehicle = Vehicle.objects.select_for_update().get(reference=data["vehicle_reference"])
                         if vehicle.status != Vehicle.Status.AVAILABLE:
                             return Response({"vehicle_reference": "Only available vehicles can be sold directly; reserved vehicles require their active reservation."}, status=status.HTTP_409_CONFLICT)
+                if not import_sale and ImportOrder.objects.filter(vehicle=vehicle).exists():
+                    return Response(
+                        {"detail": "This vehicle is linked to an import. Use the import sale workflow."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
                 sale = Sale.objects.create(vehicle=vehicle, customer=customer, representative=data.get("representative"),
                     reservation=reservation, import_order=import_order, sale_type=data["sale_type"], agreed_price_lkr=data["agreed_price_lkr"],
                     sale_date=data["sale_date"], created_by=request.user)
@@ -1267,6 +1308,11 @@ class SaleSummaryView(APIView):
 
     def get(self, request):
         sales = Sale.objects.all()
+
+        if request.user.role == User.Role.MANAGER:
+            sales = sales.exclude(
+                pk__in=import_sale_queryset().values("pk")
+            )
         return Response({"draft_count": sales.filter(status=Sale.Status.DRAFT).count(),
                          "confirmed_count": sales.filter(status=Sale.Status.CONFIRMED).count()})
 
@@ -1280,13 +1326,23 @@ class StaffDashboardSummaryView(APIView):
         today = timezone.localdate()
         since = today - timedelta(days=29)
         since_at = timezone.make_aware(datetime.combine(since, time.min), timezone.get_current_timezone())
-        confirmed_sales = Sale.objects.filter(status=Sale.Status.CONFIRMED)
+        sales = Sale.objects.all()
+        quotations = visible_quotations_for_user(
+            request.user, Quotation.objects.all()
+        )
+
+        if request.user.role == User.Role.MANAGER:
+            sales = sales.exclude(
+                pk__in=import_sale_queryset().values("pk")
+            )
+
+        confirmed_sales = sales.filter(status=Sale.Status.CONFIRMED)
         trend = (confirmed_sales.filter(confirmed_at__gte=since_at)
                  .annotate(day=TruncDate("confirmed_at", tzinfo=timezone.get_current_timezone()))
                  .values("day").annotate(count=Count("pk")).order_by("day"))
         payload = {
             "sales": {
-                "draft_count": Sale.objects.filter(status=Sale.Status.DRAFT).count(),
+                "draft_count": sales.filter(status=Sale.Status.DRAFT).count(),
                 "confirmed_count": confirmed_sales.count(),
                 "confirmed_by_day": [{"date": row["day"].isoformat(), "count": row["count"]} for row in trend],
             },
@@ -1299,14 +1355,22 @@ class StaffDashboardSummaryView(APIView):
                 "pending_count": Enquiry.objects.filter(status__in=(Enquiry.Status.NEW, Enquiry.Status.CONTACTED)).count(),
                 "appointment_count": Enquiry.objects.filter(status__in=(Enquiry.Status.NEW, Enquiry.Status.CONTACTED), kind__in=(Enquiry.Kind.APPOINTMENT, Enquiry.Kind.TEST_DRIVE)).count(),
             },
-            "quotations": {row["status"]: row["count"] for row in Quotation.objects.values("status").annotate(count=Count("pk"))},
+            "quotations": {row["status"]: row["count"] for row in quotations.values("status").annotate(count=Count("pk"))},
             "handovers": {row["status"]: row["count"] for row in Handover.objects.values("status").annotate(count=Count("pk"))},
-            "imports": {row["status"]: row["count"] for row in ImportOrder.objects.values("status").annotate(count=Count("pk"))},
+            "imports": {},
         }
+        if request.user.role in {User.Role.STAFF, User.Role.CEO}:
+            payload["imports"] = {
+                row["status"]: row["count"]
+                for row in ImportOrder.objects.values("status").annotate(count=Count("pk"))
+            }
+
         if request.user.role == User.Role.CEO:
             payload["pending_bl_approvals"] = BLApprovalRequest.objects.filter(status=BLApprovalRequest.Status.PENDING).count()
         if request.user.role in {User.Role.CEO, User.Role.MANAGER}:
-            payment_totals = Payment.objects.aggregate(
+            payment_totals = visible_payments_for_user(
+                request.user, Payment.objects.all()
+            ).aggregate(
                 verified_count=Count("pk", filter=Q(status=Payment.Status.VERIFIED)),
                 verified_amount_lkr=Sum("amount_lkr", filter=Q(status=Payment.Status.VERIFIED)),
                 pending_count=Count("pk", filter=Q(status=Payment.Status.PENDING)),
@@ -1322,9 +1386,19 @@ class SaleOptionsView(APIView):
 
     def get(self, request):
         customers = Customer.objects.all().order_by("full_name")[:500]
-        vehicles = Vehicle.objects.filter(status=Vehicle.Status.AVAILABLE).order_by("make", "model")[:500]
+        vehicles = Vehicle.objects.filter(
+            status=Vehicle.Status.AVAILABLE,
+            import_orders__isnull=True
+        ).order_by("make", "model")[:500]
         reservations = Reservation.objects.filter(status=Reservation.Status.ACTIVE, vehicle__status=Vehicle.Status.RESERVED).select_related("vehicle", "customer").order_by("-created_at")[:500]
         import_orders = ImportOrder.objects.filter(status=ImportOrder.Status.READY_FOR_COLLECTION, vehicle__status=Vehicle.Status.AVAILABLE).exclude(sales__isnull=False).select_related("vehicle", "customer").order_by("-updated_at")[:250]
+        if request.user.role == User.Role.MANAGER:
+            import_orders = ImportOrder.objects.none()
+
+        if request.user.role == User.Role.CEO:
+            vehicles = Vehicle.objects.none()
+            reservations = Reservation.objects.none()
+
         reps = RepresentativeProfile.objects.filter(business_status=RepresentativeProfile.BusinessStatus.ACTIVE).select_related("user")[:250]
         return Response({"customers": [{"id": x.pk, "full_name": x.full_name} for x in customers],
             "vehicles": [{"reference": x.reference, "name": f"{x.manufacture_year} {x.make} {x.model}", "asking_price_lkr": x.asking_price_lkr} for x in vehicles],
@@ -1339,7 +1413,14 @@ class SaleDetailView(APIView):
     permission_classes = [SalesAccess]
 
     def get(self, request, reference):
-        sale = get_object_or_404(ManagerSalesView().get_queryset(), reference=reference)
+        sales = ManagerSalesView().get_queryset()
+
+        if request.user.role == User.Role.MANAGER:
+            sales = sales.exclude(
+                pk__in=import_sale_queryset().values("pk")
+            )
+
+        sale = get_object_or_404(sales, reference=reference)
         return Response(SaleSerializer(sale).data)
 
 
@@ -1350,6 +1431,20 @@ class SaleConfirmView(APIView):
         try:
             with transaction.atomic():
                 sale = Sale.objects.select_for_update().get(reference=reference)
+
+                import_sale = is_import_sale(sale)
+
+                if import_sale and request.user.role != User.Role.CEO:
+                    return Response(
+                        {"detail": "Only the CEO may confirm import sales."},
+                        status=status.HTTP_403_FORBIDDEN,
+                    )
+
+                if not import_sale and request.user.role != User.Role.MANAGER:
+                    return Response(
+                        {"detail": "Normal vehicle sales are managed by the MD."},
+                        status=status.HTTP_403_FORBIDDEN,
+                    )
                 if sale.status != Sale.Status.DRAFT:
                     return Response({"detail": "Only draft sales can be confirmed."}, status=status.HTTP_409_CONFLICT)
                 reservation = None
@@ -1362,6 +1457,12 @@ class SaleConfirmView(APIView):
                             or import_order.vehicle_id != sale.vehicle_id or import_order.vehicle_id is None):
                         return Response({"detail": "The linked import is no longer eligible for sale confirmation."}, status=status.HTTP_409_CONFLICT)
                 vehicle = Vehicle.objects.select_for_update().get(pk=sale.vehicle_id)
+
+                if not import_sale and ImportOrder.objects.filter(vehicle=vehicle).exists():
+                    return Response(
+                        {"detail": "This vehicle must use the import sale workflow."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
                 if reservation:
                     if reservation.vehicle_id != vehicle.pk or reservation.customer_id != sale.customer_id or reservation.status != Reservation.Status.ACTIVE or vehicle.status != Vehicle.Status.RESERVED:
                         return Response({"detail": "The linked reservation or vehicle is no longer eligible for confirmation."}, status=status.HTTP_409_CONFLICT)
@@ -1423,6 +1524,54 @@ def _handover_release_errors(handover, sale=None, vehicle=None, import_order=Non
     return errors
 
 
+def _store_evidence_file(instance, field_name, upload, pending):
+    if not upload:
+        return
+
+    field_file = getattr(instance, field_name)
+    storage = field_file.storage
+    expected_name = field_file.field.generate_filename(
+        instance, upload.name
+    )
+
+    pending.append((storage, expected_name))
+
+    upload.seek(0)
+    saved_name = storage.save(expected_name, upload)
+    pending.append((storage, saved_name))
+
+    setattr(instance, field_name, saved_name)
+
+
+def _cleanup_pending_evidence(pending):
+    for storage, name in dict.fromkeys(pending):
+        try:
+            storage.delete(name)
+        except Exception as exc:
+            logger.warning(
+                "Evidence cleanup failed exception_type=%s",
+                type(exc).__name__,
+            )
+
+
+def _evidence_storage_failure(exc):
+    logger.warning(
+        "Evidence storage failure exception_type=%s errno=%s",
+        type(exc).__name__,
+        getattr(exc, "errno", None),
+    )
+
+    if getattr(exc, "errno", None) == errno.ENOSPC:
+        detail = "Storage capacity reached. Contact your administrator."
+    else:
+        detail = "Document storage is temporarily unavailable. Please retry."
+
+    return Response(
+        {"detail": detail},
+        status=status.HTTP_503_SERVICE_UNAVAILABLE,
+    )
+
+
 class HandoverCollectionView(APIView):
     permission_classes = [HandoverAccess]
     handover_action = "collection"
@@ -1452,6 +1601,7 @@ class HandoverCollectionView(APIView):
         if not sale_reference:
             return Response({"sale_reference": "Select a confirmed sale."}, status=status.HTTP_400_BAD_REQUEST)
         handover = None
+        pending_evidence = []
         try:
             with transaction.atomic():
                 try:
@@ -1463,14 +1613,30 @@ class HandoverCollectionView(APIView):
                 vehicle = Vehicle.objects.select_for_update().get(pk=sale.vehicle_id)
                 if vehicle.status != Vehicle.Status.SOLD:
                     return Response({"sale_reference": "The sale vehicle is not in the sold state required for preparation."}, status=status.HTTP_409_CONFLICT)
-                handover = Handover.objects.create(sale=sale, customer=sale.customer, vehicle=vehicle,
-                    prepared_by=request.user, **data)
+                handover = Handover(
+                    sale=sale,
+                    customer=sale.customer,
+                    vehicle=vehicle,
+                    prepared_by=request.user,
+                    **data,
+                )
+                _store_evidence_file(
+                    handover, "supporting_evidence",
+                    evidence, pending_evidence,
+                )
+                handover.save(force_insert=True)
                 AuditEvent.objects.create(actor=request.user, action="handover.prepared", subject=handover.reference,
                     details={"sale_reference": sale.reference, "vehicle_reference": vehicle.reference})
         except IntegrityError:
-            if evidence and handover and handover.supporting_evidence:
-                handover.supporting_evidence.storage.delete(handover.supporting_evidence.name)
+            _cleanup_pending_evidence(pending_evidence)
             return Response({"detail": "This sale already has a handover record."}, status=status.HTTP_409_CONFLICT)
+        except OSError as exc:
+            _cleanup_pending_evidence(pending_evidence)
+            return _evidence_storage_failure(exc)
+        except Exception:
+            _cleanup_pending_evidence(pending_evidence)
+            raise
+
         return Response(HandoverSerializer(handover).data, status=status.HTTP_201_CREATED)
 
 
@@ -1483,6 +1649,7 @@ class HandoverDetailView(APIView):
         return Response(HandoverSerializer(handover).data)
 
     def patch(self, request, reference):
+        pending_evidence = []
         try:
             with transaction.atomic():
                 handover = get_object_or_404(Handover.objects.select_for_update().select_related("sale"), reference=reference)
@@ -1502,11 +1669,22 @@ class HandoverDetailView(APIView):
                     handover.customer_acknowledged_at = timezone.now()
                 for field, value in data.items():
                     setattr(handover, field, value)
+                _store_evidence_file(
+                    handover, "supporting_evidence",
+                    evidence, pending_evidence,
+                )
                 handover.save()
                 AuditEvent.objects.create(actor=request.user, action="handover.updated", subject=handover.reference,
                     details={"fields": sorted(key for key in data if key != "supporting_evidence"), "returned_to_preparing": False})
         except Handover.DoesNotExist:
             return Response({"detail": "Handover not found."}, status=status.HTTP_404_NOT_FOUND)
+        except OSError as exc:
+            _cleanup_pending_evidence(pending_evidence)
+            return _evidence_storage_failure(exc)
+        except Exception:
+            _cleanup_pending_evidence(pending_evidence)
+            raise
+
         return Response(HandoverSerializer(handover).data)
 
 
@@ -1804,7 +1982,17 @@ class HandoverEvidenceView(APIView):
         handover = get_object_or_404(Handover, reference=reference)
         if not handover.supporting_evidence:
             return Response({"detail": "No supporting evidence is attached."}, status=status.HTTP_404_NOT_FOUND)
-        response = FileResponse(handover.supporting_evidence.open("rb"),
+        try:
+            evidence_file = handover.supporting_evidence.open("rb")
+        except FileNotFoundError:
+            return Response(
+                {"detail": "The attached document is currently unavailable."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        except OSError as exc:
+            return _evidence_storage_failure(exc)
+
+        response = FileResponse(evidence_file,
             content_type=handover.evidence_content_type or "application/octet-stream")
         response["X-Content-Type-Options"] = "nosniff"
         response["Content-Disposition"] = f'attachment; filename="handover-evidence-{handover.reference}.bin"'
@@ -1861,12 +2049,39 @@ class HandoverDocumentReceiptView(APIView):
         return response
 
 
+
+def import_sale_queryset():
+    return Sale.objects.filter(
+        Q(import_order__isnull=False) |
+        Q(sale_type=Sale.SaleType.IMPORT)
+    )
+
+
+def is_import_sale(sale):
+    return bool(
+        sale and (
+            sale.import_order_id or
+            sale.sale_type == Sale.SaleType.IMPORT
+        )
+    )
+
+
+def visible_payments_for_user(user, queryset):
+    if user.role == User.Role.MANAGER:
+        return queryset.exclude(
+            Q(import_order__isnull=False) |
+            Q(sale_id__in=import_sale_queryset().values("pk"))
+        )
+    return queryset
+
+
 class PaymentCollectionView(APIView):
     permission_classes = [PaymentAccess]
     payment_action = "collection"
 
     def get(self, request):
         payments = Payment.objects.select_related("sale__customer", "reservation__customer", "import_order__customer", "recorded_by", "verified_by", "rejected_by")
+        payments = visible_payments_for_user(request.user, payments)
         status_filter = request.query_params.get("status", "")
         method_filter = request.query_params.get("method", "")
         search = request.query_params.get("search", "").strip()
@@ -1888,11 +2103,17 @@ class PaymentCollectionView(APIView):
         sale_reference = data.pop("sale_reference", "")
         reservation_reference = data.pop("reservation_reference", "")
         import_reference = data.pop("import_reference", "")
+
+        if import_reference and request.user.role != User.Role.CEO:
+            return Response(
+                {"detail": "Only the CEO may record import payments."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         evidence = data.get("evidence")
         if evidence:
             data["evidence_content_type"] = evidence.content_type
         payment = None
-        evidence_name = None
+        pending_evidence = []
         try:
             with transaction.atomic():
                 sale = None
@@ -1927,6 +2148,14 @@ class PaymentCollectionView(APIView):
                     import_order = ImportOrder.objects.select_for_update().get(pk=import_id)
                     if not sale and Sale.objects.filter(import_order=import_order).exists():
                         return Response({"detail": "The import was linked to a sale. Refresh and retry."}, status=status.HTTP_409_CONFLICT)
+                import_related = bool(import_order or is_import_sale(sale))
+
+                if import_related and request.user.role != User.Role.CEO:
+                    return Response(
+                        {"detail": "Only the CEO may record import payments."},
+                        status=status.HTTP_403_FORBIDDEN,
+                    )
+
                 scope = Q(sale=sale) if sale else Q(reservation=reservation) if reservation else Q(import_order=import_order)
                 if sale and sale.reservation_id:
                     scope |= Q(reservation_id=sale.reservation_id)
@@ -1947,8 +2176,11 @@ class PaymentCollectionView(APIView):
                 payment = Payment(sale=sale, reservation=reservation if reservation_reference and not sale else None,
                     import_order=import_order if not sale else None,
                     recorded_by=request.user, **data)
+                _store_evidence_file(
+                    payment, "evidence",
+                    evidence, pending_evidence,
+                )
                 payment.save()
-                evidence_name = payment.evidence.name if payment.evidence else None
                 AuditEvent.objects.create(actor=request.user, action="payment.recorded", subject=payment.reference,
                     details={"status": payment.status, "method": payment.method,
                              "payment_type": payment.payment_type, "funds_cleared": payment.funds_cleared,
@@ -1956,19 +2188,27 @@ class PaymentCollectionView(APIView):
                              "reservation_reference": reservation.reference if reservation_reference else None,
                              "import_reference": import_order.reference if import_order else None,
                              "evidence_attached": bool(payment.evidence)})
-                notify_active_roles((User.Role.CEO, User.Role.MANAGER), f"payment:{payment.pk}:recorded",
+                payment_roles = (
+                    (User.Role.CEO,) if import_related
+                    else (User.Role.CEO, User.Role.MANAGER)
+                )
+                notify_active_roles(payment_roles, f"payment:{payment.pk}:recorded",
                     "Payment recorded", f"Payment {payment.reference} was recorded and confirmed.",
                     "/staff/payments", exclude_user_ids=(request.user.pk,))
                 if sale and sale_payment_summary(sale)["outstanding_balance_lkr"] == 0:
-                    notify_active_roles((User.Role.CEO, User.Role.MANAGER), f"payment:{payment.pk}:sale-settled",
+                    notify_active_roles(payment_roles, f"payment:{payment.pk}:sale-settled",
                         "Sale fully settled", f"Sale {sale.reference} has been fully settled.",
                         "/staff/payments", exclude_user_ids=(request.user.pk,))
         except IntegrityError:
-            if evidence_name:
-                payment.evidence.storage.delete(evidence_name)
-            elif payment and payment.evidence and payment.evidence.name:
-                payment.evidence.storage.delete(payment.evidence.name)
+            _cleanup_pending_evidence(pending_evidence)
             return Response({"detail": "This payment request or transaction reference has already been recorded."}, status=status.HTTP_409_CONFLICT)
+        except OSError as exc:
+            _cleanup_pending_evidence(pending_evidence)
+            return _evidence_storage_failure(exc)
+        except Exception:
+            _cleanup_pending_evidence(pending_evidence)
+            raise
+
         return Response(PaymentSerializer(payment).data, status=status.HTTP_201_CREATED)
 
 
@@ -1976,12 +2216,17 @@ class PaymentDashboardSummaryView(APIView):
     permission_classes = [PaymentAccess]
 
     def get(self, request):
-        totals = Payment.objects.aggregate(
+        payments = visible_payments_for_user(request.user, Payment.objects.all())
+        totals = payments.aggregate(
             verified_count=Count("id", filter=Q(status=Payment.Status.VERIFIED)),
             verified_amount_lkr=Sum("amount_lkr", filter=Q(status=Payment.Status.VERIFIED)),
         )
         totals["verified_amount_lkr"] = totals["verified_amount_lkr"] or Decimal("0.00")
         sales = Sale.objects.filter(status=Sale.Status.CONFIRMED).select_related("reservation", "import_order")
+        if request.user.role == User.Role.MANAGER:
+            sales = sales.exclude(
+                pk__in=import_sale_queryset().values("pk")
+            )
         settlement_rows = [sale_payment_summary(sale) for sale in sales]
         totals["outstanding_receivables_lkr"] = sum((row["outstanding_balance_lkr"] for row in settlement_rows), Decimal("0.00"))
         totals["outstanding_finance_settlement_lkr"] = sum((row["outstanding_balance_lkr"] for sale, row in zip(sales, settlement_rows) if sale.import_order_id), Decimal("0.00"))
@@ -1994,7 +2239,15 @@ class PaymentDetailView(APIView):
     permission_classes = [PaymentAccess]
 
     def get(self, request, reference):
-        payment = get_object_or_404(Payment.objects.select_related("sale__customer", "reservation__customer", "import_order__customer", "recorded_by", "verified_by", "rejected_by"), reference=reference)
+        payments = visible_payments_for_user(
+            request.user,
+            Payment.objects.select_related(
+                "sale__customer", "reservation__customer",
+                "import_order__customer", "recorded_by",
+                "verified_by", "rejected_by"
+            ),
+        )
+        payment = get_object_or_404(payments, reference=reference)
         return Response(PaymentSerializer(payment).data)
 
 
@@ -2002,10 +2255,23 @@ class PaymentEvidenceView(APIView):
     permission_classes = [PaymentAccess]
 
     def get(self, request, reference):
-        payment = get_object_or_404(Payment, reference=reference)
+        payments = visible_payments_for_user(
+            request.user, Payment.objects.all()
+        )
+        payment = get_object_or_404(payments, reference=reference)
         if not payment.evidence:
             return Response({"detail": "No payment evidence is attached."}, status=status.HTTP_404_NOT_FOUND)
-        response = FileResponse(payment.evidence.open("rb"), content_type=payment.evidence_content_type or "application/octet-stream")
+        try:
+            evidence_file = payment.evidence.open("rb")
+        except FileNotFoundError:
+            return Response(
+                {"detail": "The attached document is currently unavailable."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        except OSError as exc:
+            return _evidence_storage_failure(exc)
+
+        response = FileResponse(evidence_file, content_type=payment.evidence_content_type or "application/octet-stream")
         response["X-Content-Type-Options"] = "nosniff"
         response["Content-Disposition"] = f'attachment; filename="payment-evidence-{payment.reference}.bin"'
         response["Cache-Control"] = "private, no-store"
@@ -2019,7 +2285,11 @@ class PaymentVerifyView(APIView):
     def post(self, request, reference):
         try:
             with transaction.atomic():
-                payment = Payment.objects.select_for_update().get(reference=reference)
+                payments = visible_payments_for_user(
+                    request.user,
+                    Payment.objects.select_for_update()
+                )
+                payment = payments.get(reference=reference)
                 if payment.status != Payment.Status.PENDING:
                     return Response({"detail": "Only pending payments can be verified."}, status=status.HTTP_409_CONFLICT)
                 if payment.recorded_by_id == request.user.pk:
@@ -2098,7 +2368,11 @@ class PaymentRejectView(APIView):
         serializer.is_valid(raise_exception=True)
         try:
             with transaction.atomic():
-                payment = Payment.objects.select_for_update().get(reference=reference)
+                payments = visible_payments_for_user(
+                    request.user,
+                    Payment.objects.select_for_update()
+                )
+                payment = payments.get(reference=reference)
                 if payment.status != Payment.Status.PENDING:
                     return Response({"detail": "Only pending payments can be rejected."}, status=status.HTTP_409_CONFLICT)
                 payment.status = Payment.Status.REJECTED
@@ -2125,7 +2399,11 @@ class PaymentReverseView(APIView):
             return Response({"reason": "Reason must be 1000 characters or fewer."}, status=status.HTTP_400_BAD_REQUEST)
         try:
             with transaction.atomic():
-                payment = Payment.objects.select_for_update().get(reference=reference)
+                payments = visible_payments_for_user(
+                    request.user,
+                    Payment.objects.select_for_update()
+                )
+                payment = payments.get(reference=reference)
                 if payment.status != Payment.Status.VERIFIED:
                     return Response({"detail": "Only confirmed payments can be reversed."}, status=status.HTTP_409_CONFLICT)
                 if payment.sale_id:
@@ -2143,7 +2421,15 @@ class PaymentReverseView(APIView):
                     details={"reason": reason, "sale_reference": payment.sale.reference if payment.sale_id else None,
                              "reservation_reference": payment.reservation.reference if payment.reservation_id else None,
                              "import_reference": payment.import_order.reference if payment.import_order_id else None})
-                notify_active_roles((User.Role.CEO, User.Role.MANAGER), f"payment:{payment.pk}:reversed",
+                import_related = bool(
+                    payment.import_order_id or
+                    (payment.sale_id and is_import_sale(payment.sale))
+                )
+                payment_roles = (
+                    (User.Role.CEO,) if import_related
+                    else (User.Role.CEO, User.Role.MANAGER)
+                )
+                notify_active_roles(payment_roles, f"payment:{payment.pk}:reversed",
                     "Payment reversed", f"Payment {payment.reference} was reversed.", "/staff/payments",
                     exclude_user_ids=(request.user.pk,))
         except Payment.DoesNotExist:
@@ -2157,6 +2443,12 @@ class SalePaymentSummaryView(APIView):
 
     def get(self, request, reference):
         sale = get_object_or_404(Sale.objects.select_related("reservation", "import_order", "vehicle", "customer"), reference=reference)
+        if request.user.role == User.Role.MANAGER and is_import_sale(sale):
+            return Response(
+                {"detail": "Import settlement information is restricted to the CEO and Staff."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         scope = Q(sale=sale)
         if sale.reservation_id:
             scope |= Q(reservation_id=sale.reservation_id)
@@ -2235,12 +2527,35 @@ class QuotationFinanceOptionsView(APIView):
         return Response(finance_options())
 
 
+
+def visible_quotations_for_user(user, queryset):
+    if user.role == User.Role.MANAGER:
+        return queryset.filter(import_order__isnull=True)
+    return queryset
+
+
+def can_manage_quotation(user, import_order):
+    if user.role == User.Role.STAFF:
+        return True
+    if import_order:
+        return user.role == User.Role.CEO
+    return user.role == User.Role.MANAGER
+
+
+def quotation_write_denied():
+    return Response(
+        {"detail": "Your role cannot manage this quotation type."},
+        status=status.HTTP_403_FORBIDDEN,
+    )
+
+
 class QuotationCollectionView(APIView):
     permission_classes = [QuotationAccess]
     quotation_action = "collection"
 
     def get(self, request):
         queryset = Quotation.objects.select_related("customer", "vehicle", "import_order", "responsible_staff")
+        queryset = visible_quotations_for_user(request.user, queryset)
         _expire_due_quotations(queryset)
         query = request.query_params.get("search", "").strip()
         state = request.query_params.get("status", "")
@@ -2255,6 +2570,11 @@ class QuotationCollectionView(APIView):
     def post(self, request):
         serializer = QuotationDraftSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        if not can_manage_quotation(
+            request.user, serializer.validated_data.get("import_order")
+        ):
+            return quotation_write_denied()
+
         quotation = serializer.save(responsible_staff=request.user)
         AuditEvent.objects.create(actor=request.user, action="quotation.created", subject=quotation.reference,
                                   details={"status": quotation.status, "quotation_total_lkr": str(quotation.quotation_total_lkr)})
@@ -2265,23 +2585,43 @@ class QuotationDetailView(APIView):
     permission_classes = [QuotationAccess]
     quotation_action = "write"
 
-    def get_object(self, reference):
-        quotation = get_object_or_404(Quotation.objects.select_related("customer", "vehicle", "import_order", "responsible_staff", "voided_by"), reference=reference)
+    def get_object(self, reference, user):
+        queryset = Quotation.objects.select_related(
+            "customer", "vehicle", "import_order",
+            "responsible_staff", "voided_by"
+        )
+        quotation = get_object_or_404(
+            visible_quotations_for_user(user, queryset),
+            reference=reference,
+        )
         _expire_due_quotations(Quotation.objects.filter(pk=quotation.pk))
         quotation.refresh_from_db()
         return quotation
 
     def get(self, request, reference):
-        return Response(QuotationSerializer(self.get_object(reference)).data)
+        return Response(QuotationSerializer(self.get_object(reference, request.user)).data)
 
     def patch(self, request, reference):
         try:
             with transaction.atomic():
                 quotation = get_object_or_404(Quotation.objects.select_for_update(), reference=reference)
+                if not can_manage_quotation(
+                    request.user, quotation.import_order_id
+                ):
+                    return quotation_write_denied()
+
                 if quotation.status != Quotation.Status.DRAFT:
                     return Response({"detail": "Only draft quotations can be edited."}, status=status.HTTP_409_CONFLICT)
                 serializer = QuotationDraftSerializer(quotation, data=request.data, partial=True)
                 serializer.is_valid(raise_exception=True)
+                if not can_manage_quotation(
+                    request.user,
+                    serializer.validated_data.get(
+                        "import_order", quotation.import_order_id
+                    ),
+                ):
+                    return quotation_write_denied()
+
                 quotation = serializer.save()
                 AuditEvent.objects.create(actor=request.user, action="quotation.draft_updated", subject=quotation.reference,
                                           details={"quotation_total_lkr": str(quotation.quotation_total_lkr)})
@@ -2298,6 +2638,11 @@ class QuotationIssueView(APIView):
         try:
             with transaction.atomic():
                 quotation = get_object_or_404(Quotation.objects.select_for_update().select_related("customer"), reference=reference)
+                if not can_manage_quotation(
+                    request.user, quotation.import_order_id
+                ):
+                    return quotation_write_denied()
+
                 if quotation.status != Quotation.Status.DRAFT:
                     return Response({"detail": "Only draft quotations can be issued."}, status=status.HTTP_409_CONFLICT)
                 if quotation.expiry_date < timezone.localdate():
@@ -2326,6 +2671,11 @@ class QuotationVoidView(APIView):
         try:
             with transaction.atomic():
                 quotation = get_object_or_404(Quotation.objects.select_for_update(), reference=reference)
+                if not can_manage_quotation(
+                    request.user, quotation.import_order_id
+                ):
+                    return quotation_write_denied()
+
                 if quotation.status not in (Quotation.Status.ISSUED, Quotation.Status.EXPIRED):
                     return Response({"detail": "Only issued or expired quotations can be voided."}, status=status.HTTP_409_CONFLICT)
                 quotation.status = Quotation.Status.VOIDED
@@ -2344,7 +2694,10 @@ class QuotationPDFView(APIView):
     permission_classes = [QuotationAccess]
 
     def get(self, request, reference):
-        quotation = get_object_or_404(Quotation.objects.select_related("customer"), reference=reference)
+        queryset = visible_quotations_for_user(
+            request.user, Quotation.objects.select_related("customer")
+        )
+        quotation = get_object_or_404(queryset, reference=reference)
         _expire_due_quotations(Quotation.objects.filter(pk=quotation.pk))
         quotation.refresh_from_db()
         if not quotation.issued_snapshot:
@@ -2468,16 +2821,150 @@ class StaffInventoryDetailView(APIView):
         return Response(StaffVehicleSerializer(self.get_vehicle(reference), context={"request": request}).data)
 
     def patch(self, request, reference):
-        vehicle = self.get_vehicle(reference)
-        old_status = vehicle.status
-        serializer = StaffVehicleSerializer(vehicle, data=request.data, partial=True, context={"request": request})
-        serializer.is_valid(raise_exception=True)
-        vehicle = serializer.save()
-        AuditEvent.objects.create(actor=request.user, action="inventory.vehicle.updated", subject=vehicle.reference)
-        if vehicle.status != old_status:
-            AuditEvent.objects.create(actor=request.user, action="inventory.vehicle.status_changed", subject=vehicle.reference,
-                                      details={"from": old_status, "to": vehicle.status})
-        return Response(StaffVehicleSerializer(vehicle, context={"request": request}).data)
+        with transaction.atomic():
+            vehicle = get_object_or_404(
+                Vehicle.objects.select_for_update(),
+                reference=reference,
+            )
+            old_status = vehicle.status
+
+            serializer = StaffVehicleSerializer(
+                vehicle,
+                data=request.data,
+                partial=True,
+                context={"request": request},
+            )
+            serializer.is_valid(raise_exception=True)
+
+            active_import = ImportOrder.objects.filter(
+                vehicle=vehicle
+            ).exclude(
+                status=ImportOrder.Status.HANDED_OVER
+            ).exists()
+
+            if active_import:
+                visibility = serializer.validated_data.get("visibility")
+                next_status = serializer.validated_data.get("status")
+
+                if visibility == Vehicle.Visibility.PUBLISHED:
+                    return Response(
+                        {"detail": "Vehicles linked to an active import must remain unpublished."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+                if next_status == Vehicle.Status.ARCHIVED:
+                    return Response(
+                        {"detail": "Vehicles linked to an active import cannot be archived."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+            vehicle = serializer.save()
+
+            AuditEvent.objects.create(
+                actor=request.user,
+                action="inventory.vehicle.updated",
+                subject=vehicle.reference,
+            )
+
+            if vehicle.status != old_status:
+                AuditEvent.objects.create(
+                    actor=request.user,
+                    action="inventory.vehicle.status_changed",
+                    subject=vehicle.reference,
+                    details={"from": old_status, "to": vehicle.status},
+                )
+
+        return Response(
+            StaffVehicleSerializer(
+                vehicle, context={"request": request}
+            ).data
+        )
+
+    def delete(self, request, reference):
+        from django.db.models.deletion import ProtectedError, RestrictedError
+
+        try:
+            with transaction.atomic():
+                vehicle = get_object_or_404(
+                    Vehicle.objects.select_for_update(),
+                    reference=reference,
+                )
+
+                if vehicle.status not in {
+                    Vehicle.Status.AVAILABLE,
+                    Vehicle.Status.ARCHIVED,
+                }:
+                    return Response(
+                        {"detail": "Reserved, sold and handed-over vehicles cannot be deleted."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+                # Protect all linked business records.
+                # Vehicle photos are the only permitted cascade.
+                for relation in Vehicle._meta.related_objects:
+                    if relation.related_model is VehiclePhoto:
+                        continue
+
+                    if not (
+                        relation.one_to_many or relation.one_to_one
+                    ):
+                        continue
+
+                    if relation.related_model._base_manager.filter(
+                        **{relation.field.name: vehicle}
+                    ).exists():
+                        return Response(
+                            {"detail": "This vehicle has linked business records and cannot be deleted. Retain it for operational history."},
+                            status=status.HTTP_409_CONFLICT,
+                        )
+
+                photos = [
+                    (photo.image.storage, photo.image.name)
+                    for photo in vehicle.photos.all()
+                    if photo.image.name
+                ]
+
+                vehicle_reference = vehicle.reference
+
+                AuditEvent.objects.create(
+                    actor=request.user,
+                    action="inventory.vehicle.deleted",
+                    subject=vehicle_reference,
+                    details={
+                        "make": vehicle.make,
+                        "model": vehicle.model,
+                        "year": vehicle.manufacture_year,
+                        "status": vehicle.status,
+                        "visibility": vehicle.visibility,
+                        "photo_count": len(photos),
+                    },
+                )
+
+                vehicle.delete()
+
+                def cleanup_photos():
+                    for storage, name in photos:
+                        try:
+                            if not VehiclePhoto.objects.filter(
+                                image=name
+                            ).exists():
+                                storage.delete(name)
+                        except Exception as exc:
+                            logger.warning(
+                                "Vehicle photo cleanup failed exception_type=%s",
+                                type(exc).__name__,
+                            )
+
+                # Remove files only after the database commits.
+                transaction.on_commit(cleanup_photos)
+
+        except (ProtectedError, RestrictedError, IntegrityError):
+            return Response(
+                {"detail": "This vehicle is linked to existing records and cannot be safely deleted."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class StaffVehiclePhotosView(APIView):
@@ -2542,6 +3029,19 @@ class StaffVehiclePhotosView(APIView):
                     if digest_value in existing_hashes:
                         continue
                     existing_hashes.add(digest_value)
+
+                    from django.conf import settings
+                    if settings.SSP_STORAGE_BACKEND == "r2":
+                        from .image_optimizer import optimize_vehicle_photo
+
+                        try:
+                            upload = optimize_vehicle_photo(upload)
+                            content_type = "image/webp"
+                        except (OSError, ValueError, SyntaxError, Image.DecompressionBombError):
+                            raise ValidationError({
+                                "photos": "A photograph could not be optimized. Use a valid, non-animated image or resize it before uploading."
+                            }) from None
+
                     new_uploads.append((upload, content_type, digest_value))
 
                 if len(existing) + len(new_uploads) > self.max_photos:
@@ -2564,6 +3064,11 @@ class StaffVehiclePhotosView(APIView):
         except OSError as exc:
             _log_photo_storage_error(exc, "write")
             self._cleanup_photo_storage(storage_names)
+
+            if getattr(exc, "errno", None) == errno.ENOSPC:
+                raise PhotoStorageUnavailable(
+                    "Vehicle details are saved, but photograph storage capacity has been reached or is unavailable."
+                ) from None
             raise PhotoStorageUnavailable(
                 "Vehicle details are saved, but photographs could not be stored. Retry the upload."
             ) from None
@@ -2591,11 +3096,41 @@ class StaffVehiclePhotoDetailView(APIView):
     permission_classes = [InventoryAccess]
 
     def delete(self, request, reference, photo_id):
-        photo = get_object_or_404(VehiclePhoto, vehicle__reference=reference, pk=photo_id)
-        vehicle = photo.vehicle
-        photo.image.delete(save=False)
-        photo.delete()
-        AuditEvent.objects.create(actor=request.user, action="inventory.photo.removed", subject=reference)
+        with transaction.atomic():
+            vehicle = get_object_or_404(
+                Vehicle.objects.select_for_update(),
+                reference=reference,
+            )
+
+            photo = get_object_or_404(
+                VehiclePhoto.objects.select_for_update(),
+                vehicle=vehicle,
+                pk=photo_id,
+            )
+
+            storage = photo.image.storage
+            name = photo.image.name
+
+            photo.delete()
+
+            AuditEvent.objects.create(
+                actor=request.user,
+                action="inventory.photo.removed",
+                subject=reference,
+            )
+
+            def cleanup_photo():
+                try:
+                    if name and not VehiclePhoto.objects.filter(image=name).exists():
+                        storage.delete(name)
+                except Exception as exc:
+                    logger.warning(
+                        "Vehicle photo cleanup failed exception_type=%s",
+                        type(exc).__name__,
+                    )
+
+            transaction.on_commit(cleanup_photo)
+
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -2604,8 +3139,11 @@ class PublicVehicleListView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request):
-        vehicles = Vehicle.objects.filter(visibility=Vehicle.Visibility.PUBLISHED,
-                                           status=Vehicle.Status.AVAILABLE).prefetch_related("photos")
+        vehicles = Vehicle.objects.filter(
+            visibility=Vehicle.Visibility.PUBLISHED,
+            status=Vehicle.Status.AVAILABLE,
+            import_orders__isnull=True,
+        ).prefetch_related("photos")
         search = request.query_params.get("search", "").strip()
         if search:
             from django.db.models import Q
@@ -2635,7 +3173,8 @@ class PublicVehicleDetailView(APIView):
     def get(self, request, reference):
         vehicle = get_object_or_404(Vehicle.objects.prefetch_related("photos"),
                                     reference=reference, visibility=Vehicle.Visibility.PUBLISHED,
-                                    status=Vehicle.Status.AVAILABLE)
+                                    status=Vehicle.Status.AVAILABLE,
+                                    import_orders__isnull=True)
         return Response(PublicVehicleSerializer(vehicle, context={"request": request}).data)
 
 
@@ -2644,7 +3183,11 @@ class VehiclePhotoView(APIView):
 
     def get(self, request, photo_id):
         photo = get_object_or_404(VehiclePhoto.objects.select_related("vehicle"), pk=photo_id)
-        if photo.vehicle.visibility != Vehicle.Visibility.PUBLISHED or photo.vehicle.status != Vehicle.Status.AVAILABLE:
+        if (
+            photo.vehicle.visibility != Vehicle.Visibility.PUBLISHED
+            or photo.vehicle.status != Vehicle.Status.AVAILABLE
+            or ImportOrder.objects.filter(vehicle=photo.vehicle).exists()
+        ):
             if not request.user.is_authenticated or request.user.role not in {"staff", "ceo", "manager"}:
                 raise NotFound()
         try:
@@ -2665,6 +3208,7 @@ class VehiclePhotoView(APIView):
 
 class StaffImportsView(APIView):
     permission_classes = [ImportAccess]
+    import_action = "orders"
 
     def get(self, request, reference=None):
         qs = ImportOrder.objects.select_related("customer", "vehicle", "responsible_staff").prefetch_related(
@@ -2675,13 +3219,23 @@ class StaffImportsView(APIView):
             order = get_object_or_404(qs, reference=reference)
             data = ImportOrderSerializer(order, context={"request": request}).data
             data["milestones"] = ImportMilestoneSerializer(order.milestones.select_related("actor"), many=True).data
+            data["advance_verified"] = Payment.objects.filter(
+                Q(import_order=order) |
+                Q(sale__import_order=order),
+                status=Payment.Status.VERIFIED,
+                payment_type=Payment.PaymentType.ADVANCE,
+            ).exists()
             data["bl_requests"] = BLApprovalRequestSerializer(order.bl_requests.all(), many=True).data
             return Response(data)
         if status_filter in ImportOrder.Status.values:
             qs = qs.filter(status=status_filter)
         if search:
             qs = qs.filter(Q(reference__icontains=search) | Q(customer__full_name__icontains=search) |
-                Q(vehicle_description__icontains=search) | Q(vehicle__reference__icontains=search))
+                Q(vehicle_description__icontains=search) |
+                Q(vehicle__reference__icontains=search) |
+                Q(vehicle__make__icontains=search) |
+                Q(vehicle__model__icontains=search) |
+                Q(vehicle__variant__icontains=search))
         orders = list(qs[:250])
         data = ImportOrderSerializer(orders, many=True, context={"request": request}).data
         for record, order in zip(data, orders):
@@ -2689,19 +3243,45 @@ class StaffImportsView(APIView):
         return Response(data)
 
     def post(self, request):
-        serializer = ImportOrderSerializer(data=request.data, context={"request": request})
-        serializer.is_valid(raise_exception=True)
-        order = serializer.save(responsible_staff=request.user)
-        AuditEvent.objects.create(actor=request.user, action="import.created", subject=order.reference,
-                                  details={"customer_id": order.customer_id, "vehicle_id": order.vehicle_id})
-        return Response(ImportOrderSerializer(order, context={"request": request}).data, status=status.HTTP_201_CREATED)
+        with transaction.atomic():
+            serializer = ImportOrderSerializer(
+                data=request.data,
+                context={"request": request},
+            )
+            serializer.fields["vehicle_id"].queryset = Vehicle.objects.select_for_update()
+            serializer.is_valid(raise_exception=True)
+            order = serializer.save(responsible_staff=request.user)
+            AuditEvent.objects.create(
+                actor=request.user,
+                action="import.created",
+                subject=order.reference,
+                details={
+                    "customer_id": order.customer_id,
+                    "vehicle_id": order.vehicle_id,
+                },
+            )
+
+        return Response(
+            ImportOrderSerializer(order, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
 
     def patch(self, request, reference=None):
         if not reference:
             return Response({"detail": "An import reference is required."}, status=status.HTTP_405_METHOD_NOT_ALLOWED)
         with transaction.atomic():
             order = get_object_or_404(ImportOrder.objects.select_for_update(of=("self",)).select_related("customer", "vehicle", "responsible_staff"), reference=reference)
+            if (
+                request.user.role == User.Role.STAFF
+                and order.status != ImportOrder.Status.NEW
+            ):
+                return Response(
+                    {"detail": "Only the CEO may edit a confirmed import."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
             serializer = ImportOrderSerializer(order, data=request.data, partial=True, context={"request": request})
+            serializer.fields["vehicle_id"].queryset = Vehicle.objects.select_for_update()
             serializer.is_valid(raise_exception=True)
             order = serializer.save()
             AuditEvent.objects.create(actor=request.user, action="import.updated", subject=order.reference,
@@ -2720,6 +3300,7 @@ class ImportSummaryView(APIView):
 
 class ImportMilestoneCollectionView(APIView):
     permission_classes = [ImportAccess]
+    import_action = "milestones"
 
     def get(self, request, reference):
         order = get_object_or_404(ImportOrder, reference=reference)
@@ -2731,6 +3312,16 @@ class ImportMilestoneCollectionView(APIView):
         data = dict(serializer.validated_data)
         kind = data.pop("kind")
         payment_reference = data.pop("payment_reference", "")
+
+        if (
+            request.user.role == User.Role.STAFF
+            and kind != ImportMilestone.Kind.BOOKING_CONFIRMED
+        ):
+            return Response(
+                {"detail": "Only the CEO may record this import milestone."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         if kind == ImportMilestone.Kind.FINALIZED_HANDOVER:
             return Response({"detail": "Finalized handover is reserved for the handover workflow."}, status=status.HTTP_501_NOT_IMPLEMENTED)
         status_for_kind = {
@@ -2753,6 +3344,15 @@ class ImportMilestoneCollectionView(APIView):
         try:
             with transaction.atomic():
                 order = get_object_or_404(ImportOrder.objects.select_for_update(of=("self",)).select_related("customer", "vehicle"), reference=reference)
+                if (
+                    kind == ImportMilestone.Kind.BOOKING_CONFIRMED
+                    and not order.vehicle_id
+                ):
+                    return Response(
+                        {"detail": "Link an inventory vehicle before confirming the import."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
                 if order.milestones.filter(kind=kind).exists():
                     return Response({"detail": "This milestone has already been recorded."}, status=status.HTTP_409_CONFLICT)
                 prerequisite = prerequisites.get(kind)
@@ -2791,6 +3391,41 @@ class ImportBLRequestCollectionView(APIView):
         try:
             with transaction.atomic():
                 order = get_object_or_404(ImportOrder.objects.select_for_update(), reference=reference)
+                if not order.vehicle_id:
+                    return Response(
+                        {"detail": "Link an inventory vehicle before requesting BL."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+                if not order.milestones.filter(
+                    kind=ImportMilestone.Kind.BOOKING_CONFIRMED
+                ).exists():
+                    return Response(
+                        {"detail": "Confirm the import booking before requesting BL."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+                advance_verified = Payment.objects.filter(
+                    Q(import_order=order) |
+                    Q(sale__import_order=order),
+                    status=Payment.Status.VERIFIED,
+                    payment_type=Payment.PaymentType.ADVANCE,
+                ).exists()
+
+                if not advance_verified:
+                    return Response(
+                        {"detail": "A verified advance payment is required before requesting BL."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+                if order.bl_requests.filter(
+                    status=BLApprovalRequest.Status.APPROVED
+                ).exists():
+                    return Response(
+                        {"detail": "BL approval has already been granted."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
                 approval = BLApprovalRequest.objects.create(import_order=order, requested_by=request.user, **serializer.validated_data)
                 AuditEvent.objects.create(actor=request.user, action="import.bl_approval_requested", subject=approval.reference,
                                           details={"import_reference": order.reference})
@@ -2828,6 +3463,7 @@ class ImportBLRequestDecisionView(APIView):
 
 class ImportTrackingAccessView(APIView):
     permission_classes = [ImportAccess]
+    import_action = "tracking_access"
 
     def post(self, request, reference):
         with transaction.atomic():
@@ -2892,6 +3528,12 @@ class StaffReservationsView(APIView):
                 vehicle = Vehicle.objects.select_for_update().get(reference=data["vehicle_reference"])
                 if vehicle.status != Vehicle.Status.AVAILABLE:
                     return Response({"detail": "This vehicle is no longer available to reserve."}, status=status.HTTP_409_CONFLICT)
+                if ImportOrder.objects.filter(vehicle=vehicle).exists():
+                    return Response(
+                        {"detail": "This vehicle is linked to an import and cannot be reserved through the ordinary stock workflow."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
                 vehicle.status = Vehicle.Status.RESERVED
                 vehicle.save(update_fields=["status", "updated_at"])
                 reservation = Reservation.objects.create(vehicle=vehicle, customer=data["customer"],
@@ -2923,7 +3565,10 @@ class StaffReservationOptionsView(APIView):
 
     def get(self, request):
         customers = Customer.objects.all().order_by("full_name")[:500]
-        vehicles = Vehicle.objects.filter(status=Vehicle.Status.AVAILABLE).order_by("make", "model")[:500]
+        vehicles = Vehicle.objects.filter(
+            status=Vehicle.Status.AVAILABLE,
+            import_orders__isnull=True,
+        ).order_by("make", "model")[:500]
         representatives = RepresentativeProfile.objects.filter(business_status=RepresentativeProfile.BusinessStatus.ACTIVE).select_related("user")
         return Response({
             "customers": [{"id": c.pk, "full_name": c.full_name, "phone": c.phone, "email": c.email} for c in customers],
