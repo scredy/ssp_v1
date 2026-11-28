@@ -52,18 +52,25 @@ class PaymentApiTests(APITestCase):
 
     def make_import(self, user=None, customer=None):
         self.client.force_authenticate(user or self.staff)
-        return self.client.post("/api/staff/imports/", {"customer_id": (customer or self.customer).pk,
-            "vehicle_description": "Toyota import order", "country_of_origin": "Japan"}, format="json")
+        vehicle = self.make_vehicle(uuid4().hex[:12])
+        vehicle.visibility = Vehicle.Visibility.DRAFT
+        vehicle.save(update_fields=["visibility"])
+
+        return self.client.post("/api/staff/imports/", {
+            "customer_id": (customer or self.customer).pk,
+            "vehicle_id": vehicle.pk,
+            "country_of_origin": "Japan",
+        }, format="json")
 
     def import_payment(self, reference, transaction_reference="IMPORT-PAYMENT-001", user=None):
-        return self.record_payment(user or self.manager, {"import_reference": reference, "amount_lkr": "125.50",
+        return self.record_payment(user or self.ceo, {"import_reference": reference, "amount_lkr": "125.50", "payment_type": "advance",
             "method": "bank_transfer", "transaction_reference": transaction_reference, "funds_cleared": True, "payment_date": "2026-11-21"})
 
-    def test_import_payment_without_vehicle_verification_summary_and_milestone(self):
+    def test_import_payment_with_linked_vehicle_summary_and_milestone(self):
         created = self.make_import(self.staff)
         self.assertEqual(created.status_code, status.HTTP_201_CREATED)
         order = ImportOrder.objects.get(reference=created.data["reference"])
-        self.assertIsNone(order.vehicle_id)
+        self.assertIsNotNone(order.vehicle_id)
         response = self.import_payment(order.reference)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(response.data["import_reference"], order.reference)
@@ -72,6 +79,7 @@ class PaymentApiTests(APITestCase):
         summary = self.client.get(f"/api/staff/imports/{order.reference}/payments/summary/")
         self.assertEqual(Decimal(summary.data["verified_amount_lkr"]), Decimal("125.50"))
         self.assertIsNone(summary.data["outstanding_balance_lkr"])
+        self.client.force_authenticate(self.ceo)
         milestone = self.client.post(f"/api/staff/imports/{order.reference}/milestones/", {
             "kind": "payment_verified", "payment_reference": response.data["reference"],
             "customer_description": "A payment for this import has been verified."}, format="json")
@@ -83,13 +91,15 @@ class PaymentApiTests(APITestCase):
         self.client.force_authenticate(self.staff)
         denied = self.import_payment(order.reference, "IMPORT-STAFF-DENIED", self.staff)
         self.assertEqual(denied.status_code, status.HTTP_403_FORBIDDEN)
-        self.client.force_authenticate(self.manager)
-        payment = self.import_payment(order.reference, "IMPORT-PAYMENT-REJECT", self.manager)
+        denied_md = self.import_payment(order.reference, "IMPORT-MD-DENIED", self.manager)
+        self.assertEqual(denied_md.status_code, 403)
+        self.client.force_authenticate(self.ceo)
+        payment = self.import_payment(order.reference, "IMPORT-PAYMENT-REJECT", self.ceo)
         self.assertEqual(payment.status_code, status.HTTP_201_CREATED)
         other_customer = Customer.objects.create(full_name="Different Import Customer")
         other_import = ImportOrder.objects.create(customer=other_customer, vehicle_description="Other vehicle",
             country_of_origin="Japan", responsible_staff=self.staff)
-        self.client.force_authenticate(self.staff)
+        self.client.force_authenticate(self.ceo)
         mismatch = self.client.post(f"/api/staff/imports/{other_import.reference}/milestones/", {
             "kind": "payment_verified", "payment_reference": payment.data["reference"],
             "customer_description": "Should not be allowed."}, format="json")
@@ -98,24 +108,31 @@ class PaymentApiTests(APITestCase):
         rejected = self.client.post(f"/api/staff/payments/{payment.data['reference']}/reject/",
             {"rejection_reason": "Transfer receipt could not be matched."}, format="json")
         self.assertEqual(rejected.status_code, status.HTTP_409_CONFLICT)
-        duplicate = self.import_payment(order.reference, "IMPORT-PAYMENT-REJECT", self.manager)
+        duplicate = self.import_payment(order.reference, "IMPORT-PAYMENT-REJECT", self.ceo)
         self.assertEqual(duplicate.status_code, status.HTTP_409_CONFLICT)
-        self.client.force_authenticate(self.manager)
+        self.client.force_authenticate(self.ceo)
         reversed_payment = self.client.post(f"/api/staff/payments/{payment.data['reference']}/reverse/",
             {"reason": "Duplicate import payment record."}, format="json")
         self.assertEqual(reversed_payment.status_code, status.HTTP_200_OK)
         self.assertEqual(reversed_payment.data["status"], Payment.Status.REVERSED)
-        good = self.import_payment(order.reference, "IMPORT-PAYMENT-VERIFIED", self.manager)
+        good = self.import_payment(order.reference, "IMPORT-PAYMENT-VERIFIED", self.ceo)
         self.assertEqual(good.data["status"], Payment.Status.VERIFIED)
-        order.vehicle = self.vehicle
-        order.save(update_fields=["vehicle"])
-        sale = Sale.objects.create(vehicle=self.vehicle, customer=self.customer, import_order=order,
-            agreed_price_lkr=Decimal("1000.00"), created_by=self.manager)
+        sale = Sale.objects.create(vehicle=order.vehicle, customer=self.customer, import_order=order,
+            sale_type=Sale.SaleType.IMPORT,
+            agreed_price_lkr=Decimal("1000.00"), created_by=self.ceo)
         import_summary = self.client.get(f"/api/staff/imports/{order.reference}/payments/summary/")
         sale_summary = self.client.get(f"/api/manager/sales/{sale.reference}/payments/summary/")
         self.assertEqual(Decimal(import_summary.data["verified_amount_lkr"]), Decimal("125.50"))
         self.assertEqual(Decimal(sale_summary.data["verified_received_lkr"]), Decimal("125.50"))
         self.assertEqual(Payment.objects.filter(import_order=order).count(), 2)
+
+        self.client.force_authenticate(self.manager)
+        self.assertEqual(self.client.get(f"/api/staff/imports/{order.reference}/payments/summary/").status_code, 403)
+        self.assertEqual(self.client.get(f"/api/staff/payments/{payment.data['reference']}/").status_code, 404)
+
+        listed = self.client.get("/api/staff/payments/")
+        self.assertEqual(listed.status_code, 200)
+        self.assertNotIn(payment.data["reference"], [item["reference"] for item in listed.data])
 
     def test_import_agreed_price_and_remaining_payment_workflow(self):
         created = self.make_import()
@@ -126,7 +143,7 @@ class PaymentApiTests(APITestCase):
         self.assertEqual(advance.status_code, status.HTTP_201_CREATED)
 
         payload = {"agreed_price_lkr": "1000.00", "reason": "Customer agreement"}
-        for denied in (self.staff, self.rep, self.admin):
+        for denied in (self.staff, self.manager, self.rep, self.admin):
             self.client.force_authenticate(denied)
             self.assertEqual(
                 self.client.patch(url, payload, format="json").status_code,
@@ -147,7 +164,7 @@ class PaymentApiTests(APITestCase):
             action="import.agreed_price.updated", subject=order.reference
         ).exists())
 
-        overpayment = self.record_payment(self.manager, {
+        overpayment = self.record_payment(self.ceo, {
             "import_reference": order.reference,
             "amount_lkr": "875.00",
             "method": "cash",
@@ -165,18 +182,16 @@ class PaymentApiTests(APITestCase):
         )
         self.assertEqual(result.status_code, status.HTTP_409_CONFLICT)
 
-        partial = self.record_payment(self.manager, {
+        partial = self.record_payment(self.ceo, {
             "import_reference": order.reference,
             "amount_lkr": "374.50",
             "method": "cash",
         })
         self.assertEqual(partial.status_code, status.HTTP_201_CREATED)
 
-        vehicle = self.make_vehicle("import-price")
         order.refresh_from_db()
-        order.vehicle = vehicle
         order.status = ImportOrder.Status.READY_FOR_COLLECTION
-        order.save(update_fields=["vehicle", "status"])
+        order.save(update_fields=["status"])
 
         sale_payload = {
             "sale_type": "import",

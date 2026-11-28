@@ -222,7 +222,7 @@ def main():
         playwright = HARNESS / "node_modules" / ".bin" / "playwright.cmd"
         if not playwright.is_file():
             raise SystemExit("Playwright is not installed under test-harness/node_modules.")
-        completed = subprocess.run([str(playwright), "test"], cwd=HARNESS, env=env)
+        completed = subprocess.run([str(playwright), "test", *sys.argv[1:]], cwd=HARNESS, env=env)
         result = completed.returncode
     finally:
         for process in (web_tls, web_process, api_tls, api_process):

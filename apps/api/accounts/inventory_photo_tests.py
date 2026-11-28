@@ -158,3 +158,53 @@ class InventoryPhotoUploadTests(APITestCase):
         self.assertEqual(overflow.status_code, 400)
         self.assertEqual(VehiclePhoto.objects.filter(vehicle__reference=vehicle["reference"]).count(), 10)
 
+    def test_unused_vehicle_deletion_removes_photos(self):
+        vehicle = self.create_vehicle("DELETE-UNUSED")
+        self.assertTrue(vehicle["can_delete"])
+
+        uploaded = self.upload(
+            vehicle["reference"], self.image_upload()
+        )
+        self.assertEqual(uploaded.status_code, 201)
+
+        photo = VehiclePhoto.objects.get(
+            vehicle__reference=vehicle["reference"]
+        )
+        storage = photo.image.storage
+        name = photo.image.name
+
+        self.assertTrue(storage.exists(name))
+
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.delete(
+                f"/api/staff/inventory/{vehicle['reference']}/"
+            )
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(
+            Vehicle.objects.filter(reference=vehicle["reference"]).exists()
+        )
+        self.assertFalse(storage.exists(name))
+
+    def test_read_only_roles_cannot_delete_vehicle(self):
+        vehicle = self.create_vehicle("DELETE-READ-ONLY")
+
+        for role in (User.Role.CEO, User.Role.MANAGER):
+            reviewer = User.objects.create_user(
+                username=f"delete-reviewer-{role}",
+                email=f"delete-reviewer-{role}@example.test",
+                password="Strong-password-914!",
+                role=role,
+            )
+
+            self.client.force_authenticate(reviewer)
+
+            response = self.client.delete(
+                f"/api/staff/inventory/{vehicle['reference']}/"
+            )
+
+            self.assertEqual(response.status_code, 403)
+
+        self.assertTrue(
+            Vehicle.objects.filter(reference=vehicle["reference"]).exists()
+        )

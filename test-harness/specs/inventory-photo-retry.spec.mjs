@@ -60,7 +60,7 @@ test('created vehicle stays editable and retries photos without creating another
 
   await page.getByRole('button', { name: 'Create vehicle' }).click();
   await expect(page.getByRole('heading', { name: 'Update vehicle details' })).toBeVisible();
-  await expect(page.locator('.inventory-message.is-error')).toHaveText('Vehicle details saved successfully, but photographs could not be uploaded. Retry uploading photographs to complete this vehicle.');
+  await expect(page.locator('.inventory-message.is-error')).toHaveText('Vehicle details saved. Photo upload failed: Storage temporarily unavailable. You can retry the photographs without creating another vehicle.');
   await expect(page.getByRole('button', { name: 'Retry photo upload' })).toBeVisible();
   await expect(page.getByText(vehicle.reference).first()).toBeVisible();
 

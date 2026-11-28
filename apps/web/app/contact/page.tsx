@@ -1,10 +1,13 @@
+import { socialMetadata } from "@/lib/seo";
 import type { Metadata } from "next";
 import { COMPANY_CONTACT, emailHref, phoneHref } from "@/lib/site-config";
 import { PublicContactActions, PublicPageFrame } from "@/components/public-site";
 import { Suspense } from "react";
 import PublicEnquiryForm from "@/components/public-enquiry-form";
 
-export const metadata: Metadata = { title: "Contact", description: "Contact SSP Motor Trading about available vehicles using verified configured company contact details." };
+export const metadata: Metadata = {
+  ...socialMetadata("Contact Us | SSP Motor Trading", "Contact SSP Motor Trading about available vehicles using verified configured company contact details.", "/contact"),
+ title: "Contact Us", description: "Contact SSP Motor Trading about available vehicles using verified configured company contact details." };
 
 export default function ContactPage() {
   const phone = phoneHref(COMPANY_CONTACT.phone);

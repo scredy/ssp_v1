@@ -6,6 +6,12 @@ import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { api, photoUrl, User, Vehicle } from "@/lib/car-api";
 import { BrandLogo } from "@/components/public-site";
 
+type InventoryVehicle = Vehicle & {
+  can_delete?: boolean;
+  has_import_link?: boolean;
+  has_active_import?: boolean;
+};
+
 const blank: Partial<Vehicle> = { make: "", model: "", variant: "", manufacture_year: new Date().getFullYear(), mileage_km: 0, fuel_type: "petrol", transmission: "automatic", color: "", condition: "used", internal_identifier: "", asking_price_lkr: "", description: "", visibility: "draft", status: "available" };
 const currency = (value: string) => new Intl.NumberFormat("en-LK", { style: "currency", currency: "LKR", maximumFractionDigits: 0 }).format(Number(value));
 const allowedRoles = ["staff", "ceo", "manager"];
@@ -15,13 +21,13 @@ const roleLabels: Record<string, string> = { staff: "Staff", ceo: "CEO", manager
 
 export default function StaffInventoryPage() {
   const [user, setUser] = useState<User | null>(null);
-  const [vehicles, setVehicles] = useState<Vehicle[]>([]);
+  const [vehicles, setVehicles] = useState<InventoryVehicle[]>([]);
   const [query, setQuery] = useState("");
   const [availability, setAvailability] = useState("");
   const [publication, setPublication] = useState("");
   const [makeFilter, setMakeFilter] = useState("");
   const [conditionFilter, setConditionFilter] = useState("");
-  const [editing, setEditing] = useState<Vehicle | null>(null);
+  const [editing, setEditing] = useState<InventoryVehicle | null>(null);
   const [creating, setCreating] = useState(false);
   const [details, setDetails] = useState<string | null>(null);
   const [photoFiles, setPhotoFiles] = useState<File[]>([]);
@@ -35,14 +41,14 @@ export default function StaffInventoryPage() {
   const canManage = user?.role === "staff";
 
   async function refresh() {
-    const currentVehicles = await api<Vehicle[]>("/api/staff/inventory/");
+    const currentVehicles = await api<InventoryVehicle[]>("/api/staff/inventory/");
     setVehicles(currentVehicles);
     return currentVehicles;
   }
   useEffect(() => {
     api<User>("/api/auth/me/").then(async (current) => {
       if (!allowedRoles.includes(current.role)) throw new Error("Your role does not have inventory access.");
-      setUser(current); setVehicles(await api<Vehicle[]>("/api/staff/inventory/"));
+      setUser(current); setVehicles(await api<InventoryVehicle[]>("/api/staff/inventory/"));
     }).catch((cause) => setError(cause instanceof Error ? cause.message : "Unable to load inventory."))
       .finally(() => setLoading(false));
   }, []);
@@ -72,12 +78,14 @@ export default function StaffInventoryPage() {
     try {
       if (Number(payload.manufacture_year) < 1886 || Number(payload.manufacture_year) > new Date().getFullYear() + 1) throw new Error("Enter a valid manufacture year.");
       if (Number(payload.mileage_km) < 0 || Number(payload.mileage_km) > 2000000 || Number(payload.asking_price_lkr) <= 0) throw new Error("Check mileage and enter a price greater than zero.");
-      if (photoFiles.length + (editing?.photos.length ?? 0) > 10) throw new Error("A vehicle can have at most 10 photos.");
-      let saved: Vehicle;
-      if (editing) {
-        saved = await api<Vehicle>(`/api/staff/inventory/${editing.reference}/`, { method: "PATCH", body: JSON.stringify(payload) });
+      if (!photoUploadFailed && photoFiles.length + (editing?.photos.length ?? 0) > 10) throw new Error("A vehicle can have at most 10 photos.");
+      let saved: InventoryVehicle;
+      if (editing && photoUploadFailed) {
+        saved = editing;
+      } else if (editing) {
+        saved = await api<InventoryVehicle>(`/api/staff/inventory/${editing.reference}/`, { method: "PATCH", body: JSON.stringify(payload) });
       } else {
-        saved = await api<Vehicle>("/api/staff/inventory/", { method: "POST", body: JSON.stringify(payload) });
+        saved = await api<InventoryVehicle>("/api/staff/inventory/", { method: "POST", body: JSON.stringify(payload) });
         // Keep the vehicle reference before the separate photo request starts.
         setEditing(saved);
         setCreating(false);
@@ -85,13 +93,17 @@ export default function StaffInventoryPage() {
       if (photoFiles.length) {
         const photoData = new FormData(); photoFiles.forEach((file) => photoData.append("photos", file));
         try {
-          saved = await api<Vehicle>(`/api/staff/inventory/${saved.reference}/photos/`, { method: "POST", body: photoData });
-        } catch {
+          saved = await api<InventoryVehicle>(`/api/staff/inventory/${saved.reference}/photos/`, { method: "POST", body: photoData });
+        } catch (cause) {
           setPhotoUploadFailed(true);
           setEditing(saved);
           setCreating(false);
           await refresh().catch(() => undefined);
-          setError("Vehicle details saved successfully, but photographs could not be uploaded. Retry uploading photographs to complete this vehicle.");
+          setError(
+            "Vehicle details saved. Photo upload failed: " +
+            (cause instanceof Error ? cause.message : "Unknown upload error.") +
+            " You can retry the photographs without creating another vehicle."
+          );
           return;
         }
       }
@@ -114,7 +126,7 @@ export default function StaffInventoryPage() {
     } finally { saveInFlight.current = false; setBusy(false); }
   }
 
-  async function togglePublication(vehicle: Vehicle) {
+  async function togglePublication(vehicle: InventoryVehicle) {
     const publishing = vehicle.visibility !== "published";
     if (publishing && vehicle.status !== "available") { setError("Only available vehicles can be published as public stock."); return; }
     setBusy(true); setError(""); setNotice("");
@@ -123,7 +135,7 @@ export default function StaffInventoryPage() {
     finally { setBusy(false); }
   }
 
-  async function changeStatus(vehicle: Vehicle, next: "available" | "archived") {
+  async function changeStatus(vehicle: InventoryVehicle, next: "available" | "archived") {
     const action = next === "archived" ? "Archive" : "Restore";
     const message = next === "archived" ? `Archive ${vehicle.reference}? It will be removed from public available stock.` : `Restore ${vehicle.reference} to available stock?`;
     if (!window.confirm(message)) return;
@@ -133,7 +145,51 @@ export default function StaffInventoryPage() {
     finally { setBusy(false); }
   }
 
-  async function removePhoto(vehicle: Vehicle, photoId: number) {
+  async function deleteVehicle(vehicle: InventoryVehicle) {
+    if (!canManage || busy || !vehicle.can_delete) return;
+
+    if (!window.confirm(
+      `Permanently delete ${vehicle.manufacture_year} ${vehicle.make} ${vehicle.model} (${vehicle.reference})? Its photographs will also be removed. This cannot be undone.`
+    )) return;
+
+    setBusy(true);
+    setError("");
+    setNotice("");
+
+    try {
+      await api(
+        `/api/staff/inventory/${vehicle.reference}/`,
+        { method: "DELETE" }
+      );
+
+      setVehicles(current => current.filter(
+        item => item.reference !== vehicle.reference
+      ));
+
+      if (details === vehicle.reference) setDetails(null);
+
+      if (editing?.reference === vehicle.reference) {
+        setEditing(null);
+        setCreating(false);
+        setPhotoFiles([]);
+        setPhotoUploadFailed(false);
+      }
+
+      setNotice(`${vehicle.reference} permanently deleted.`);
+      await refresh().catch(() => undefined);
+
+    } catch (cause) {
+      setError(
+        cause instanceof Error
+          ? cause.message
+          : "Unable to delete this vehicle."
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removePhoto(vehicle: InventoryVehicle, photoId: number) {
     if (!canManage) return;
     setBusy(true); setError("");
     try { await api(`/api/staff/inventory/${vehicle.reference}/photos/${photoId}/`, { method: "DELETE" }); await refresh(); setEditing((current) => current?.reference === vehicle.reference ? { ...current, photos: current.photos.filter((photo) => photo.id !== photoId) } : current); }
@@ -169,18 +225,28 @@ export default function StaffInventoryPage() {
         <label>Fuel type<select name="fuel_type" defaultValue={editing?.fuel_type ?? blank.fuel_type}><option value="petrol">Petrol</option><option value="diesel">Diesel</option><option value="hybrid">Hybrid</option><option value="electric">Electric</option><option value="other">Other</option></select></label>
         <label>Transmission<select name="transmission" defaultValue={editing?.transmission ?? blank.transmission}><option value="automatic">Automatic</option><option value="manual">Manual</option><option value="other">Other</option></select></label><label>Color<input name="color" required maxLength={50} defaultValue={editing?.color ?? blank.color} /></label>
         <label>Condition<select name="condition" defaultValue={editing?.condition ?? blank.condition}><option value="new">New</option><option value="used">Used</option><option value="reconditioned">Reconditioned</option></select></label><label>Chassis / VIN / stock ID<input name="internal_identifier" required maxLength={100} defaultValue={editing?.internal_identifier ?? ""} /><span className="inventory-help">Private; not shown in public listings.</span></label>
-        <label>Asking price (LKR)<input name="asking_price_lkr" type="number" required min="0.01" step="0.01" defaultValue={editing?.asking_price_lkr ?? ""} /></label><label>Publication<select name="visibility" defaultValue={editing?.visibility ?? "draft"}><option value="draft">Draft</option><option value="published">Published</option></select></label>
+        <label>Asking price (LKR)<input name="asking_price_lkr" type="number" required min="0.01" step="0.01" defaultValue={editing?.asking_price_lkr ?? ""} /></label><label>Publication<select name="visibility" defaultValue={editing?.has_active_import ? "draft" : editing?.visibility ?? "draft"}><option value="draft">Draft</option><option value="published" disabled={editing?.has_active_import}>Published</option></select></label>
         <label className="form-wide">Description<textarea name="description" rows={3} defaultValue={editing?.description ?? ""} /></label>
         {canManage && <label className="form-wide">Add photographs<input name="photos" type="file" accept="image/jpeg,image/png,image/webp" multiple onChange={(event) => setPhotoFiles(Array.from(event.currentTarget.files ?? []))} /><span className="inventory-help">JPEG, PNG or WebP, up to 8 MB each; 10 photos per vehicle.</span></label>}
       </div>
       {photoPreviews.length > 0 && <section className="photo-preview-grid" aria-label="Selected photograph previews">{photoPreviews.map((url, index) => <div key={`${url}-${index}`}><img src={url} alt={`Selected vehicle photo ${index + 1}`} /><span>New photo {index + 1}</span><button type="button" className="inventory-text-button" onClick={() => setPhotoFiles((files) => files.filter((_, fileIndex) => fileIndex !== index))}>Remove</button></div>)}</section>}
       {editing?.photos.length ? <section className="photo-preview-grid existing-photos" aria-label="Current vehicle photographs"><h3>Current photographs</h3>{editing.photos.map((photo) => <div key={photo.id}><img src={photoUrl(photo)} alt="Vehicle" />{canManage && <button type="button" className="inventory-text-button" disabled={busy} onClick={() => void removePhoto(editing, photo.id)}>Remove</button>}</div>)}</section> : null}
-      <button className="inventory-primary" disabled={busy}>{busy ? "Saving…" : photoUploadFailed ? "Retry photo upload" : editing ? "Save changes" : "Create vehicle"}</button>
+      {photoUploadFailed && <p className="inventory-help">Retry uploads the selected photographs only. Vehicle details have already been saved.</p>}
+      <button className="inventory-primary" disabled={busy || (photoUploadFailed && photoFiles.length === 0)}>{busy ? "Saving…" : photoUploadFailed ? "Retry photo upload" : editing ? "Save changes" : "Create vehicle"}</button>
     </form>}
     <section className="inventory-table-wrap" aria-live="polite">
       {vehicles.length === 0 ? <p className="inventory-empty">No vehicle records yet.{canManage ? " Add a vehicle to start building inventory." : ""}</p> : filtered.length === 0 ? <p className="inventory-empty">No vehicles match these filters.</p> : <table className="inventory-table"><thead><tr><th>Vehicle</th><th>Reference</th><th>Condition</th><th>Availability</th><th>Publication</th><th>Price</th><th>Actions</th></tr></thead><tbody>{filtered.map((vehicle) =>
-        <Fragment key={vehicle.reference}><tr><td><div className="inventory-vehicle-cell">{vehicle.photos[0] ? <img src={photoUrl(vehicle.photos[0])} alt="" /> : <span className="inventory-image-placeholder">SSP</span>}<span><strong>{vehicle.manufacture_year} {vehicle.make} {vehicle.model}</strong><small>{vehicle.variant || "Standard"} · {vehicle.mileage_km.toLocaleString()} km</small></span></div></td><td>{vehicle.reference}</td><td>{vehicle.condition}</td><td><span className={`stock-status stock-${vehicle.status}`}>{statusLabels[vehicle.status ?? "available"] ?? vehicle.status}</span></td><td><span className={`publication-status publication-${vehicle.visibility}`}>{vehicle.visibility}</span></td><td>{currency(vehicle.asking_price_lkr)}</td>
-          <td><div className="inventory-actions"><button className="inventory-secondary" onClick={() => setDetails(details === vehicle.reference ? null : vehicle.reference)}>{details === vehicle.reference ? "Hide" : "Details"}</button>{canManage && <>{vehicle.status === "available" && <Link className="inventory-secondary" href={`/staff/reservations?vehicle=${encodeURIComponent(vehicle.reference)}`}>Reserve</Link>}<button className="inventory-secondary" disabled={busy} onClick={() => { setEditing(vehicle); setCreating(false); setPhotoFiles([]); setPhotoUploadFailed(false); setError(""); setNotice(""); }}>Edit</button><button className="inventory-secondary" disabled={busy || (vehicle.status !== "available" && vehicle.visibility !== "published")} onClick={() => void togglePublication(vehicle)}>{vehicle.visibility === "published" ? "Unpublish" : "Publish"}</button>{vehicle.status === "available" ? <button className="inventory-danger" disabled={busy} onClick={() => void changeStatus(vehicle, "archived")}>Archive</button> : vehicle.status === "archived" ? <button className="inventory-secondary" disabled={busy} onClick={() => void changeStatus(vehicle, "available")}>Restore</button> : <span className="inventory-help">Lifecycle locked</span>}</>}</div></td></tr>
+        <Fragment key={vehicle.reference}><tr><td><div className="inventory-vehicle-cell">{vehicle.photos[0] ? <img src={photoUrl(vehicle.photos[0])} alt="" /> : <span className="inventory-image-placeholder">SSP</span>}<span><strong>{vehicle.manufacture_year} {vehicle.make} {vehicle.model}</strong><small>{vehicle.variant || "Standard"} · {vehicle.mileage_km.toLocaleString()} km</small></span></div></td><td>{vehicle.reference}</td><td>{vehicle.condition}</td><td><span className={`stock-status stock-${vehicle.status}`}>{statusLabels[vehicle.status ?? "available"] ?? vehicle.status}</span>
+    {vehicle.has_active_import && <small className="inventory-help">Linked to active import</small>}</td><td><span className={`publication-status publication-${vehicle.visibility}`}>{vehicle.visibility}</span></td><td>{currency(vehicle.asking_price_lkr)}</td>
+          <td><div className="inventory-actions"><button className="inventory-secondary" onClick={() => setDetails(details === vehicle.reference ? null : vehicle.reference)}>{details === vehicle.reference ? "Hide" : "Details"}</button>{canManage && <>{vehicle.status === "available" && !vehicle.has_import_link && <Link className="inventory-secondary" href={`/staff/reservations?vehicle=${encodeURIComponent(vehicle.reference)}`}>Reserve</Link>}<button className="inventory-secondary" disabled={busy} onClick={() => { setEditing(vehicle); setCreating(false); setPhotoFiles([]); setPhotoUploadFailed(false); setError(""); setNotice(""); }}>Edit</button><button className="inventory-secondary" disabled={busy || (vehicle.has_active_import && vehicle.visibility !== "published") || (vehicle.status !== "available" && vehicle.visibility !== "published")} onClick={() => void togglePublication(vehicle)}>{vehicle.visibility === "published" ? "Unpublish" : "Publish"}</button>{vehicle.status === "available" ? <button className="inventory-danger" disabled={busy || vehicle.has_active_import} onClick={() => void changeStatus(vehicle, "archived")}>Archive</button> : vehicle.status === "archived" ? <button className="inventory-secondary" disabled={busy} onClick={() => void changeStatus(vehicle, "available")}>Restore</button> : <span className="inventory-help">Lifecycle locked</span>}
+    {vehicle.can_delete
+      ? <button type="button" className="inventory-danger"
+          disabled={busy}
+          onClick={() => void deleteVehicle(vehicle)}>
+          Delete
+        </button>
+      : <span className="inventory-help" title="Linked records and lifecycle history are protected.">Deletion protected</span>}
+    </>}</div></td></tr>
         {details === vehicle.reference && <tr className="inventory-detail"><td colSpan={7}><div className="inventory-detail-content"><p><strong>Color:</strong> {vehicle.color} · <strong>Fuel:</strong> {vehicle.fuel_type} · <strong>Transmission:</strong> {vehicle.transmission}</p><p><strong>Internal identifier:</strong> {canManage ? vehicle.internal_identifier : "Hidden for read-only review"}</p>{vehicle.description && <p>{vehicle.description}</p>}<div className="detail-photo-strip">{vehicle.photos.map((photo) => <img key={photo.id} src={photoUrl(photo)} alt={`${vehicle.make} ${vehicle.model}`} />)}</div></div></td></tr>}</Fragment>
       )}</tbody></table>}
     </section>

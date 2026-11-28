@@ -1,7 +1,11 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { SITE_URL, SITE_NAME, SITE_DESCRIPTION, socialMetadata } from "@/lib/seo";
 
 export const metadata: Metadata = {
+  metadataBase: new URL(SITE_URL),
+  ...socialMetadata(SITE_NAME, SITE_DESCRIPTION, "/"),
+
   title: { default: "SSP Motor Trading", template: "%s | SSP Motor Trading" },
   description: "Explore vehicle listings and illustrative finance estimates from SSP Motor Trading.",
   applicationName: "SSP Motor Trading",

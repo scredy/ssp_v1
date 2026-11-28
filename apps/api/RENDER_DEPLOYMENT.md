@@ -49,6 +49,7 @@ Save and let Render restart the backend. Do not add `BREVO_API_KEY` to GitHub, t
 
 Customer enquiry acknowledgements and staff-confirmed/rescheduled appointment messages use a shared Django HTML template with a plain-text alternative. The existing `ACCOUNT_PORTAL_URL` supplies the public logo URL (`/branding/ssp-logo-display.png`); ensure the frontend deploy includes the repository's `apps/web/public/branding/ssp-logo-display.png` asset. No new production environment variable is required. The template uses the existing web palette tokens (`#111315` charcoal, `#c72d37` SSP red, and `#aeb3b8` muted silver), plus white and neutral text backgrounds. Company contact fields remain optional and are shown only when configured.
 
+
 Vehicle handover completion emails use the shared branded customer template and are triggered only after successful MD finalization. The email displays the recorded completion date in Sri Lanka time.
 
 Migration `0027_handover_completion_email` must be applied during backend deployment. No additional environment variables are required.
@@ -93,30 +94,67 @@ python manage.py shell -c "from accounts.models import User; print({'count': Use
 
 If no production Admin exists, run `python manage.py createsuperuser` through that authenticated Shell session and enter a unique, strong password interactively. Confirm the resulting role and sign-in through the frontend. Local development or test accounts are not production accounts. Do not run account creation against a local/test database by mistake; first confirm the Render service's internal `POSTGRES_*` configuration is attached. Free services are intended for evaluation rather than production workloads; persistent database and media backups remain necessary.
 
+
 ## Uploaded media persistence
 
-Render Free Web Services have an ephemeral filesystem and do not support persistent disks. A configured path such as `/var/data/media` only works when `/var/data` is mounted and writable; without that mount, upload writes can fail. The provided production 500 status does not reveal the exception, so use the new safe `accounts.views` storage diagnostic (`category`, `phase`, exception type and errno) to confirm whether the failure is permission denied, missing mount, full storage, or another I/O error. The upload response now returns 503 rather than an unclassified 500 for storage failures.
+Production uses Cloudflare R2 private object storage.
+Local development defaults to filesystem storage.
 
-For a **non-production temporary test only**, a Free instance can use its ephemeral `/tmp` filesystem. This checks whether the rest of the upload flow works but does not retain files through restart, spin-down, or redeploy. Never use these paths for live vehicle media or private financial evidence:
+### Backend environment variables
 
-```text
-MEDIA_ROOT=/tmp/ssp/media
-PRIVATE_PAYMENT_EVIDENCE_ROOT=/tmp/ssp/private_payment_evidence
-PRIVATE_HANDOVER_EVIDENCE_ROOT=/tmp/ssp/private_handover_evidence
+Configure these on the Render Django backend only:
+
+| Variable | Value |
+| --- | --- |
+| SSP_STORAGE_BACKEND | r2 |
+| R2_ENDPOINT_URL | Account-level Cloudflare S3 HTTPS endpoint |
+| R2_ACCESS_KEY_ID | Restricted R2 access key |
+| R2_SECRET_ACCESS_KEY | Restricted R2 secret key |
+| R2_VEHICLE_BUCKET | ssp-vehicle-photos |
+| R2_PRIVATE_BUCKET | ssp-private-documents |
+
+Both buckets must remain private and use Standard storage.
+Grant Object Read & Write permission only to these two buckets.
+Never store credentials in GitHub or frontend environment variables.
+
+### Storage behavior
+
+- Vehicle photos use the vehicle bucket.
+- Payment and handover evidence use the private document bucket.
+- Existing permission-controlled API endpoints serve stored files.
+- New vehicle images are optimized to WebP, up to 500 KB and 1920 pixels per side.
+- A vehicle may have up to 10 photos.
+- Private evidence is not compressed.
+- Combined storage usage is checked before new uploads.
+- Usage warnings are logged at 7 GB.
+- Uploads exceeding 8 GB are rejected.
+- PostgreSQL advisory locks coordinate application uploads.
+- These controls do not constitute a Cloudflare billing cap.
+
+Set a Cloudflare billing alert at $1.
+Monitor storage and request usage independently.
+
+### Render Free startup command
+
+```sh
+python manage.py migrate --noinput && gunicorn config.wsgi:application --bind 0.0.0.0:$PORT --workers 1 --threads 1 --timeout 120
 ```
 
-Render persistent disks preserve local files, but are only available on paid services. Attach a disk mounted at `/var/data` and set all three paths below to directories on that disk to retain vehicle photos and private payment/handover evidence across deploys:
+No persistent Render disk is required in R2 mode.
+Static assets continue to use WhiteNoise.
 
-```text
-MEDIA_ROOT=/var/data/media
-PRIVATE_PAYMENT_EVIDENCE_ROOT=/var/data/private_payment_evidence
-PRIVATE_HANDOVER_EVIDENCE_ROOT=/var/data/private_handover_evidence
-```
+### Deployment and migration precautions
 
-Private evidence remains outside the public media directory and is served only through the existing permission-checked API. Without the disk and these variables, uploaded files can be lost when Render replaces the instance. Back up the disk separately; a disk mounted by one instance also needs a deliberate storage design before scaling to multiple instances.
+Before changing storage providers, inspect existing database file references
+and migrate any existing accessible files while retaining object keys.
 
-### Lower-cost durable object storage option
+Switching storage providers does not recover previously lost files.
 
-For a small catalogue while keeping Render Web Services Free, Cloudflare R2 is the recommended next storage implementation: use a **private** bucket and Django-only S3-compatible credentials. Put vehicle photos, payment evidence, and handover evidence in separate prefixes (or separate private buckets). Keep photo reads and private document reads behind Django's existing permission-checked endpoints; do not expose R2 credentials or public object URLs in the frontend. This preserves draft/reserved/sold/archived photo access rules and private evidence checks. Required backend configuration would be an R2 account ID/endpoint, bucket, access key ID, secret access key, and region `auto`, followed by a Django storage adapter and a migration plan for existing files. No provider has been enabled by this change.
+Keep PostgreSQL backups separately from object storage backups.
+Render Free PostgreSQL databases expire and must be migrated or
+upgraded before expiration.
 
-Cloudflare's current R2 Standard rate is $0.015/GB-month with 10 GB-month, 1 million Class A requests and 10 million Class B requests included monthly; internet egress is free. Render lists persistent disks at $0.25/GB-month, in addition to moving the backend to a paid plan. Cloudinary's image-oriented free plan uses 25 monthly credits across storage, image bandwidth and transformations, and is therefore less predictable as the catalogue grows; private evidence would still need an authenticated/private delivery design. R2 is the lowest-cost fit for a private, single-storage architecture, while Render disks are the simpler option if upgrading backend compute is acceptable.
+Verify upload, authorized retrieval, unauthorized access rejection,
+deletion and persistence after a restart.
+
+Do not use the production R2 configuration for automated tests.

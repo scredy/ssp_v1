@@ -1,8 +1,11 @@
+import { socialMetadata } from "@/lib/seo";
 import type { Metadata } from "next";
 import Link from "next/link";
 import { PublicPageFrame } from "@/components/public-site";
 
-export const metadata: Metadata = { title: "About SSP", description: "Learn about SSP Motor Trading and explore currently available vehicle listings." };
+export const metadata: Metadata = {
+  ...socialMetadata("About Us | SSP Motor Trading", "Learn about SSP Motor Trading and explore currently available vehicle listings.", "/about"),
+ title: "About Us", description: "Learn about SSP Motor Trading and explore currently available vehicle listings." };
 
 export default function AboutPage() {
   return <PublicPageFrame active="/about"><main className="public-main about-main">

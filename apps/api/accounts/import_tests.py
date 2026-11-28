@@ -42,35 +42,48 @@ class ImportApiTests(APITestCase):
         self.assertEqual(Vehicle.objects.count(), 1)
         self.assertEqual(self.vehicle.status, Vehicle.Status.AVAILABLE)
         self.assertTrue(AuditEvent.objects.filter(action="import.created", subject=order.reference).exists())
-        self.client.force_authenticate(self.manager)
+        self.client.force_authenticate(self.ceo)
         summary = self.client.get("/api/staff/imports/summary/")
         self.assertEqual(summary.data["total_count"], 1)
         self.assertEqual(summary.data["status_counts"][ImportOrder.Status.NEW], 1)
 
-    def test_role_permissions_enforce_staff_write_and_leadership_read_only(self):
+    def test_role_permissions_enforce_staff_and_ceo_import_access(self):
         created = self.create_import()
+        self.assertEqual(created.status_code, 201, created.data)
         detail = f"/api/staff/imports/{created.data['reference']}/"
-        for user in (self.ceo, self.manager):
+
+        for user in (self.staff, self.ceo):
             self.client.force_authenticate(user)
-            self.assertEqual(self.client.get("/api/staff/imports/").status_code, status.HTTP_200_OK)
-            self.assertEqual(self.client.get(detail).status_code, status.HTTP_200_OK)
-            self.assertEqual(self.client.post("/api/staff/imports/", self.payload(), format="json").status_code, status.HTTP_403_FORBIDDEN)
-            self.assertEqual(self.client.patch(detail, {"customer_updates": "Changed"}, format="json").status_code, status.HTTP_403_FORBIDDEN)
-        for user in (self.rep, self.admin):
+            self.assertEqual(self.client.get("/api/staff/imports/").status_code, 200)
+            self.assertEqual(self.client.get(detail).status_code, 200)
+            self.assertEqual(
+                self.client.patch(detail, {"customer_updates": "Changed"}, format="json").status_code,
+                200,
+            )
+
+        for user in (self.manager, self.rep, self.admin):
             self.client.force_authenticate(user)
-            self.assertEqual(self.client.get("/api/staff/imports/").status_code, status.HTTP_403_FORBIDDEN)
-            self.assertEqual(self.client.post("/api/staff/imports/", self.payload(), format="json").status_code, status.HTTP_403_FORBIDDEN)
+            self.assertEqual(self.client.get("/api/staff/imports/").status_code, 403)
+            self.assertEqual(self.client.get(detail).status_code, 403)
+            self.assertEqual(self.client.post("/api/staff/imports/", self.payload(), format="json").status_code, 403)
+            self.assertEqual(self.client.patch(detail, {"customer_updates": "Denied"}, format="json").status_code, 403)
+
         self.client.force_authenticate(None)
-        self.assertEqual(self.client.get("/api/staff/imports/").status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(self.client.get("/api/staff/imports/").status_code, 403)
 
     def test_milestones_are_append_only_and_follow_operational_prerequisites(self):
         order = self.create_import().data
         endpoint = f"/api/staff/imports/{order['reference']}/milestones/"
         self.client.force_authenticate(self.staff)
         blocked = self.client.post(endpoint, {"kind": "shipping", "customer_description": "Shipping started."}, format="json")
+        self.assertEqual(blocked.status_code, status.HTTP_403_FORBIDDEN)
+        self.client.force_authenticate(self.ceo)
+        blocked = self.client.post(endpoint, {"kind": "shipping", "customer_description": "Shipping started."}, format="json")
         self.assertEqual(blocked.status_code, status.HTTP_409_CONFLICT)
+        self.client.force_authenticate(self.staff)
         booking = self.client.post(endpoint, {"kind": "booking_confirmed", "customer_description": "Your import booking is confirmed."}, format="json")
         self.assertEqual(booking.status_code, status.HTTP_201_CREATED)
+        self.client.force_authenticate(self.ceo)
         lc = self.client.post(endpoint, {"kind": "lc_opened", "customer_description": "The letter of credit has been opened."}, format="json")
         self.assertEqual(lc.status_code, status.HTTP_201_CREATED)
         self.assertEqual(self.client.post(endpoint, {"kind": "lc_opened", "customer_description": "Duplicate."}, format="json").status_code, status.HTTP_409_CONFLICT)
@@ -93,21 +106,55 @@ class ImportApiTests(APITestCase):
         self.assertEqual(self.client.post(endpoint, body, format="json").status_code, status.HTTP_400_BAD_REQUEST)
         booking = self.client.post(endpoint, {"kind": "booking_confirmed", "customer_description": "Booking confirmed."}, format="json")
         self.assertEqual(booking.status_code, status.HTTP_201_CREATED)
-        self.client.force_authenticate(self.manager)
+        self.client.force_authenticate(self.ceo)
         payment_response = self.client.post("/api/staff/payments/", {"import_reference": order["reference"],
-            "amount_lkr": "100", "method": "cash", "transaction_reference": "IMPORT-MILESTONE-TEST",
+            "amount_lkr": "100", "method": "cash", "payment_type": "advance", "transaction_reference": "IMPORT-MILESTONE-TEST",
             "idempotency_key": "import-milestone-payment-test"}, format="json")
         self.assertEqual(payment_response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(payment_response.data["status"], Payment.Status.VERIFIED)
         payment = Payment.objects.get(reference=payment_response.data["reference"])
-        self.client.force_authenticate(self.staff)
         body["payment_reference"] = payment.reference
+        self.client.force_authenticate(self.staff)
+        self.assertEqual(self.client.post(endpoint, body, format="json").status_code, 403)
+        self.client.force_authenticate(self.ceo)
         verified = self.client.post(endpoint, body, format="json")
         self.assertEqual(verified.status_code, status.HTTP_201_CREATED)
         self.assertNotIn("payment_reference", verified.data)
 
+    def prepare_bl_request(self, order):
+        reference = order["reference"]
+        milestone_url = f"/api/staff/imports/{reference}/milestones/"
+        request_url = f"/api/staff/imports/{reference}/bl-requests/"
+
+        self.client.force_authenticate(self.staff)
+
+        # Booking and advance are both mandatory.
+        self.assertEqual(self.client.post(request_url, {}, format="json").status_code, 409)
+
+        booking = self.client.post(milestone_url, {
+            "kind": "booking_confirmed",
+            "customer_description": "Booking confirmed.",
+        }, format="json")
+        self.assertEqual(booking.status_code, 201, booking.data)
+
+        self.assertEqual(self.client.post(request_url, {}, format="json").status_code, 409)
+
+        self.client.force_authenticate(self.ceo)
+        advance = self.client.post("/api/staff/payments/", {
+            "import_reference": reference,
+            "amount_lkr": "100.00",
+            "method": "cash",
+            "payment_type": "advance",
+            "idempotency_key": "bl-test-advance-payment",
+        }, format="json")
+        self.assertEqual(advance.status_code, 201, advance.data)
+        self.assertEqual(advance.data["status"], Payment.Status.VERIFIED)
+
+        self.client.force_authenticate(self.staff)
+
     def test_bl_approval_is_ceo_only_reasoned_and_separate_from_bl_issuance(self):
         order = self.create_import().data
+        self.prepare_bl_request(order)
         request_url = f"/api/staff/imports/{order['reference']}/bl-requests/"
         self.client.force_authenticate(self.staff)
         approval = self.client.post(request_url, {"request_note": "Carrier documents are ready."}, format="json")
@@ -124,17 +171,18 @@ class ImportApiTests(APITestCase):
         self.assertIsNotNone(decided.data["decided_at"])
         self.assertEqual(self.client.post(decision_url, {"decision": "rejected", "rejection_reason": "Late"}, format="json").status_code, status.HTTP_409_CONFLICT)
         order_detail = self.client.get(f"/api/staff/imports/{order['reference']}/").data
-        self.assertEqual(order_detail["status"], ImportOrder.Status.NEW)
-        self.client.force_authenticate(self.staff)
+        self.assertEqual(order_detail["status"], ImportOrder.Status.BOOKING_CONFIRMED)
+        self.client.force_authenticate(self.ceo)
         milestone_url = f"/api/staff/imports/{order['reference']}/milestones/"
-        self.client.post(milestone_url, {"kind": "booking_confirmed", "customer_description": "Booking confirmed."}, format="json")
-        self.client.post(milestone_url, {"kind": "lc_opened", "customer_description": "LC opened."}, format="json")
+        lc = self.client.post(milestone_url, {"kind": "lc_opened", "customer_description": "LC opened."}, format="json")
+        self.assertEqual(lc.status_code, 201, lc.data)
         issued = self.client.post(milestone_url, {"kind": "bl_issued", "customer_description": "Bill of lading issued."}, format="json")
         self.assertEqual(issued.status_code, status.HTTP_201_CREATED)
         self.assertEqual(ImportOrder.objects.get(reference=order["reference"]).status, ImportOrder.Status.BL_ISSUED)
 
     def test_bl_rejection_requires_reason_and_preserves_decision_history(self):
         order = self.create_import().data
+        self.prepare_bl_request(order)
         self.client.force_authenticate(self.staff)
         approval = self.client.post(f"/api/staff/imports/{order['reference']}/bl-requests/", {}, format="json")
         self.client.force_authenticate(self.ceo)
@@ -148,6 +196,9 @@ class ImportApiTests(APITestCase):
     def test_tracking_pin_is_hashed_and_public_response_exposes_only_customer_safe_data(self):
         order = self.create_import().data
         self.client.force_authenticate(self.staff)
+        denied = self.client.post(f"/api/staff/imports/{order['reference']}/tracking-access/", {}, format="json")
+        self.assertEqual(denied.status_code, 403)
+        self.client.force_authenticate(self.ceo)
         access_response = self.client.post(f"/api/staff/imports/{order['reference']}/tracking-access/", {}, format="json")
         self.assertEqual(access_response.status_code, status.HTTP_200_OK)
         access = ImportTrackingAccess.objects.get(import_order__reference=order["reference"])
@@ -167,7 +218,7 @@ class ImportApiTests(APITestCase):
 
     def test_tracking_invalid_credentials_are_generic_and_rate_limited(self):
         order = self.create_import().data
-        self.client.force_authenticate(self.staff)
+        self.client.force_authenticate(self.ceo)
         access = self.client.post(f"/api/staff/imports/{order['reference']}/tracking-access/", {}, format="json").data
         self.client.force_authenticate(None)
         url = "/api/public/import-tracking/"
@@ -181,3 +232,45 @@ class ImportApiTests(APITestCase):
             self.assertEqual(self.client.post(url, {"tracking_reference": "TRK-UNKNOWN", "pin": "wrong"}, format="json").status_code, status.HTTP_404_NOT_FOUND)
         limited = self.client.post(url, {"tracking_reference": "TRK-UNKNOWN", "pin": "wrong"}, format="json")
         self.assertEqual(limited.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+    def test_import_requires_available_draft_vehicle(self):
+        payload = self.payload()
+        payload.pop("vehicle_id")
+
+        self.assertEqual(self.create_import(payload=payload).status_code, 400)
+        self.assertEqual(self.create_import(payload=self.payload(vehicle_id=None)).status_code, 400)
+
+        self.vehicle.visibility = Vehicle.Visibility.PUBLISHED
+        self.vehicle.save(update_fields=["visibility"])
+
+        self.assertEqual(self.create_import().status_code, 400)
+
+        self.vehicle.visibility = Vehicle.Visibility.DRAFT
+        self.vehicle.save(update_fields=["visibility"])
+
+        created = self.create_import(user=self.ceo)
+        self.assertEqual(created.status_code, 201, created.data)
+        self.assertEqual(created.data["vehicle_id"], self.vehicle.pk)
+
+        self.assertEqual(self.create_import().status_code, 400)
+
+        order = ImportOrder.objects.get(reference=created.data["reference"])
+        self.assertEqual(order.vehicle_id, self.vehicle.pk)
+        self.assertIn(self.vehicle.model, order.vehicle_description)
+        self.assertEqual(ImportOrder.objects.count(), 1)
+
+    def test_import_vehicle_cannot_be_published_reserved_or_deleted(self):
+        created = self.create_import()
+        self.assertEqual(created.status_code, 201, created.data)
+        url = f"/api/staff/inventory/{self.vehicle.reference}/"
+
+        self.assertEqual(self.client.patch(url, {"visibility": "published"}, format="json").status_code, 409)
+        self.assertEqual(self.client.patch(url, {"status": "archived"}, format="json").status_code, 409)
+        self.assertEqual(self.client.delete(url).status_code, 409)
+
+        reserved = self.client.post("/api/staff/reservations/", {
+            "customer_id": self.customer.pk,
+            "vehicle_reference": self.vehicle.reference,
+            "agreed_price_lkr": "10000000",
+        }, format="json")
+        self.assertEqual(reserved.status_code, 409)

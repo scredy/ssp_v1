@@ -107,8 +107,11 @@ test('Continuation: sales, payment review, handover, commission, Rep and notific
       writeState(s); return `Manager API fallback confirmed direct sale ${ref} for Ruwan Silva and Toyota Corolla Cross.`;
     });
 
-    await step(page, 'Staff', 'Advance import tracking through collection readiness', 'CEO-approved BL request is issued and import reaches ready for collection', async () => {
-      await page.getByRole('button', { name: 'Sign out' }).click(); await login(page, s.staff); await page.goto('/staff/imports');
+    await step(page, 'CEO', 'Advance import tracking through collection readiness', 'CEO-approved BL request is issued and import reaches ready for collection', async () => {
+      const denied = await apiCall(page, '/api/staff/imports/');
+      expect(denied.status).toBe(403);
+
+      await page.getByRole('button', { name: 'Sign out' }).click(); await login(page, s.ceo); await page.goto('/staff/imports');
       await page.getByRole('row').filter({ hasText: s.importOrder }).click();
       let order = await apiCall(page, `/api/staff/imports/${s.importOrder}/`);
       expect(order.status).toBe(200);
@@ -147,24 +150,19 @@ test('Continuation: sales, payment review, handover, commission, Rep and notific
       expect(order.data.status).toBe('ready_for_collection');
       expect(timeline.status).toBe(200);
       expect(timeline.data.some(item => item.kind === 'ready_for_collection')).toBe(true);
-      if (!order.data.vehicle_id) {
-        const inventory = await apiCall(page, '/api/staff/inventory/');
-        const stock = inventory.data.find(item => item.reference === s.vehicles[2].reference);
-        expect(stock, `Expected registered stock ${s.vehicles[2].reference} for the linked import fixture.`).toBeTruthy();
-        const linked = await apiCall(page, `/api/staff/imports/${s.importOrder}/`, 'PATCH', { vehicle_id: stock.id });
-        expect(linked.status, JSON.stringify(linked.data)).toBe(200);
-        order = await apiCall(page, `/api/staff/imports/${s.importOrder}/`);
-      }
+      expect(order.data.vehicle_id, 'Import vehicle must already be linked.').toBeTruthy();
       expect(order.data.vehicle_reference).toBe(s.vehicles[2].reference);
       const readyStock = await linkedVehicle();
       expect(readyStock.status).toBe('available');
       return `${s.importOrder} reached collection readiness with registered vehicle ${order.data.vehicle_reference} linked.`;
     });
 
-    await step(page, 'MD/Manager', 'Create and confirm import sale', 'Ready import order creates a draft sale linked to its customer and vehicle', async () => {
+    await step(page, 'CEO', 'Create and confirm import sale', 'Ready import order creates a draft sale linked to its customer and vehicle', async () => {
       if (s.importSale) return `Import sale ${s.importSale} already exists from a prior continuation attempt.`;
       if (!(await page.getByRole('button', { name: 'Sign out' }).count())) throw new Error('No authenticated portal session available.');
-      await page.getByRole('button', { name: 'Sign out' }).click(); await login(page, s.manager);
+
+      await page.goto('/staff/sales');
+      await expect(page.getByRole('button', { name: '+ New sale' })).toBeVisible();
       const opts = await apiCall(page, '/api/manager/sales/options/'); expect(opts.status).toBe(200);
       const rep = opts.data.representatives.find(x => x.name.includes('Kavindu Silva'));
       const result = await apiCall(page, '/api/manager/sales/', 'POST', { sale_type: 'import', import_reference: s.importOrder, representative_id: rep.id, agreed_price_lkr: '17900000', sale_date: '2026-11-23' });
@@ -177,7 +175,7 @@ test('Continuation: sales, payment review, handover, commission, Rep and notific
       const stock = inventory.data.find(item => item.reference === s.vehicles[2].reference);
       expect(stock).toBeTruthy();
       expect(stock.status).toBe('sold');
-      writeState(s); return `Manager API fallback confirmed import sale ${ref} for ready order ${s.importOrder}.`;
+      writeState(s); return `CEO API confirmed import sale ${ref} for ready order ${s.importOrder}.`;
     });
 
     await step(page, 'CEO', 'Configure commission policy through authorized API fallback', 'A 2.5% effective schedule is saved before handover finalization; commission policy UI failure is retained', async () => {
@@ -341,12 +339,12 @@ test('Continuation: sales, payment review, handover, commission, Rep and notific
       return 'Rep views assigned sales and the paid commission entry; no other-user rows asserted.';
     });
 
-    await step(page, 'CEO', 'Check manager oversight and CEO read-only sales controls', 'CEO can inspect Manager activity and Sales without New sale action', async () => {
+    await step(page, 'CEO', 'Check manager oversight and CEO import sale controls', 'CEO can inspect Manager activity and manage import sales', async () => {
       await page.getByRole('button', { name: 'Sign out' }).click(); await login(page, s.ceo);
       await page.goto('/staff/oversight/managers'); await expect(page.getByRole('heading', { name: 'Leadership oversight' })).toBeVisible();
       await page.goto('/staff/sales'); await expect(page.getByRole('heading', { name: 'Sales' })).toBeVisible();
-      await expect(page.getByRole('button', { name: '+ New sale' })).toHaveCount(0);
-      return 'CEO oversight route rendered; sales review has no New sale control.';
+      await expect(page.getByRole('button', { name: '+ New sale' })).toBeVisible();
+      return 'CEO oversight and import sale controls rendered.';
     });
 
     await step(page, 'CEO', 'Review notifications and read-state controls', 'CEO inbox displays workflow updates and supports read/unread changes', async () => {
